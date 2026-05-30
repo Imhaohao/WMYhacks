@@ -235,6 +235,8 @@ pipecat-core-code/
 # Eval harness runtime outputs (Person 2)
 server/eval/results/
 server/eval/prompts/voicemail_agent_v[1-9]*.txt
+server/eval/prompts/voicemail_agent_demo_v*.txt
+server/eval/cekura_ids.json
 
 # Part B ingestion secrets + generated artifacts (Person 2) — never commit.
 # (No inline comments below: .gitignore treats trailing text as part of the pattern.)

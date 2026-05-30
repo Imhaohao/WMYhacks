@@ -21,8 +21,8 @@ Run locally::
 import asyncio
 import json
 import os
-from pathlib import Path
 import time
+from pathlib import Path
 
 import aiohttp
 from dotenv import load_dotenv
@@ -60,9 +60,6 @@ load_dotenv(_ENV_DIR / ".env.local", override=True)
 from pipecat.services.gradium.stt import GradiumSTTService
 from pipecat.transcriptions.language import Language
 
-from interfaces import TOOL_REGISTRY, CallState, build_system_instruction, default_call_state
-from nemotron_llm import VLLMOpenAILLMService
-
 # ── P2 / P3 modules append to TOOL_REGISTRY at import time ────────────────────
 # Add an import line here once each teammate's module is ready:
 #   import calendar_tools   # P2 — appends book_callback_slot, get_calendar_availability
@@ -70,6 +67,7 @@ from interfaces import TOOL_REGISTRY, CallState, build_system_instruction, defau
 from nemotron_llm import VLLMOpenAILLMService
 
 import persona_tools  # isort: skip  # P3 — appends 4 tools and on_call_finished hook
+import cekura_observe  # isort: skip  # Observability: POST call transcript to Cekura on disconnect
 
 
 # ─── Twilio helper ────────────────────────────────────────────────────────────
@@ -466,7 +464,7 @@ async def run_bot(
                         triage.get("confidence", 0.0),
                         final_urgency,
                     )
-            except asyncio.TimeoutError:
+            except TimeoutError:
                 logger.warning(
                     "Triage oracle timed out — using caller's stated urgency: %r", stated
                 )
@@ -830,6 +828,24 @@ async def run_bot(
     async def on_client_disconnected(transport, client):
         logger.info(f"Client disconnected — call_state summary: {call_state['voicemail']}")
         persona_tools.on_call_finished(call_state)  # P3 — persist voicemail (never raises)
+
+        # ── Cekura Observability (fire-and-forget, never raises) ───────────────
+        # Build a stable call_id from recorded_at + caller_number so each real
+        # call gets a reproducible unique id without requiring Math.random.
+        _vm = call_state["voicemail"]
+        _cid_raw = f"{_vm.get('recorded_at', '')}-{_vm.get('caller_number', 'unknown')}"
+        _call_id = _cid_raw.replace(":", "").replace("+", "").replace(" ", "-")
+        # Extract turns from the live LLM context messages (richer than the string
+        # transcript field which may be empty if P1 didn't append to it).
+        _turns = cekura_observe._turns_from_context_messages(context.messages)
+        await cekura_observe.observe_call(
+            call_state,
+            call_id=_call_id,
+            customer_number=_vm.get("caller_number") or None,
+            transcript_turns=_turns,
+        )
+        # ─────────────────────────────────────────────────────────────────────
+
         await worker.cancel()
 
     runner = WorkerRunner(handle_sigint=False)
