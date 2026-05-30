@@ -1,0 +1,72 @@
+@import url("https://fonts.googleapis.com/css2?family=DM+Sans:ital,opsz,wght@0,9..40,400;0,9..40,500;0,9..40,600;0,9..40,700;1,9..40,400&family=Fraunces:ital,opsz,wght@0,9..144,400;0,9..144,500;0,9..144,600;0,9..144,700;1,9..144,500&display=swap");
+@import "tailwindcss";
+
+@theme {
+  --font-display: "Fraunces", Georgia, serif;
+  --font-sans: "DM Sans", system-ui, sans-serif;
+
+  /* warm parchment canvas + ink */
+  --color-canvas: #ece5d4;
+  --color-parchment: #f4efe3;
+  --color-ink: #38403a;
+
+  /* sage — primary accent (muted post-expressionist green) */
+  --color-sage-50: #f1f4ec;
+  --color-sage-100: #e3e9d7;
+  --color-sage-200: #c9d4b4;
+  --color-sage-300: #aaba8c;
+  --color-sage-400: #8ea06c;
+  --color-sage-500: #738755;
+  --color-sage-600: #5c6e44;
+  --color-sage-700: #485737;
+  --color-sage-800: #39452e;
+  --color-sage-900: #2f3927;
+
+  /* dusk — dusty blue secondary */
+  --color-dusk-50: #eef2f4;
+  --color-dusk-100: #dde5ea;
+  --color-dusk-200: #bccdd6;
+  --color-dusk-300: #93aebd;
+  --color-dusk-400: #6f93a6;
+  --color-dusk-500: #547a8e;
+  --color-dusk-600: #436374;
+  --color-dusk-700: #374f5d;
+  --color-dusk-800: #2f414c;
+  --color-dusk-900: #283742;
+
+  /* mauve — soft lavender highlight */
+  --color-mauve-300: #b8b2c8;
+  --color-mauve-400: #a098b6;
+  --color-mauve-500: #877e9e;
+}
+
+@layer base {
+  * {
+    border-color: color-mix(in srgb, var(--color-ink) 14%, transparent);
+  }
+
+  body {
+    background-color: var(--color-canvas);
+    color: var(--color-ink);
+    @apply antialiased;
+    font-family: var(--font-sans);
+  }
+
+  h1,
+  h2,
+  h3 {
+    font-family: var(--font-display);
+    letter-spacing: -0.01em;
+  }
+}
+
+@layer utilities {
+  /* Soft painterly wash — cream base brushed with sage / dusk / lavender light */
+  .bg-wash {
+    background-color: var(--color-parchment);
+    background-image:
+      radial-gradient(38rem 28rem at 12% 8%, rgba(142, 160, 108, 0.32), transparent 60%),
+      radial-gradient(34rem 26rem at 88% 18%, rgba(111, 147, 166, 0.3), transparent 62%),
+      radial-gradient(40rem 32rem at 50% 112%, rgba(160, 152, 182, 0.3), transparent 60%);
+  }
+}
