@@ -346,6 +346,17 @@ async def run_bot(
         f"Caller context: {caller_context}"
     )
 
+    # Person 2 (Part A/B): layer in the owner's private context — the curated
+    # baseline plus summaries derived from real iMessage / Calendar / past
+    # Claude sessions (see ingest/, refreshed via `python -m ingest.refresh`).
+    # load_persona_context() returns "" if the file is missing/empty and appends
+    # its own privacy guard, so this is a safe no-op until the file is populated.
+    from persona_context import load_persona_context
+
+    persona = load_persona_context()
+    if persona:
+        system_instruction += "\n\n" + persona
+
     # Speech-to-Text service
     #
     # Nemotron Speech Streaming STT, served over WebSocket. The server expects

@@ -134,7 +134,7 @@ Acceptance:
 **DONE — Part A (curated baseline, Tier 0):**
 
 - `server/persona_context.md` — curated owner context (Persona, Current Priorities, Availability, People Rules, Callback Style, Recent Agent Context, Example Replies).
-- `server/persona_context.py` — `load_persona_context()` loader. Safe fallback: missing → `""`, empty/comment-only → `""`; strips HTML comments; appends a standing PRIVACY guard so context is reasoning-only and never recited. `has_persona_context()` helper. **Injection seam for P1:** call `load_persona_context()` and concatenate into `system_instruction` in `bot-nemotron.py` (coordinate exact spot with P1).
+- `server/persona_context.py` — `load_persona_context()` loader. Safe fallback: missing → `""`, empty/comment-only → `""`; strips HTML comments; appends a standing PRIVACY guard so context is reasoning-only and never recited. `has_persona_context()` helper. **Injection seam: WIRED** — `bot-nemotron.py` concatenates `load_persona_context()` into `system_instruction` (right after it's built).
 - `server/test_persona_context.py` — 5 tests (real / missing / empty / comment-only / guard toggle). All pass, ruff-clean.
 
 **DONE — Part C (the Cekura loop), in MOCK mode + wired for live:** `server/eval/` package:
@@ -151,10 +151,20 @@ Acceptance:
 
 **Verified loop result (stub engine):** v0 weak prompt → aggregate **0.699**, **60%** pass (correct_screening 0%); after 1 auto-improve round → aggregate **0.884**, **100%** pass. The FAIL→PASS flip is the demo finale and runs as one command: `uv run python -m eval.improve --rounds 1`.
 
-**DEFERRED — Part B (live ingestion):** not built yet, gated on access:
+**DONE — Part B (LIVE ingestion), all three sources verified end-to-end:** `server/ingest/` package. Derives summaries from the owner's real data and writes them into `persona_context.md` (the file the bot already loads — the running bot can't call Claude's MCP tools, so a sync-into-the-file design is the right shape).
 
-- iMessage ingestion — needs macOS **Full Disk Access** for the terminal + a **local Ollama** model up (privacy: summarize locally, never send raw messages to cloud). Ollama/compute-box were unreachable at build time.
-- Live Calendar read — needs **Google Calendar OAuth** (only the `authenticate` tool is exposed; connector not yet authorized).
+- `persona_sections.py` — idempotent comment-fenced section editor; replaces a source's block in place, keeps curated fallback lines, fences invisible to the bot (loader strips HTML comments).
+- `local_llm.py` — **strict-local** summarizer: local Ollama → deterministic extractor. `strict_local=True` (default) NEVER touches a cloud model, so iMessage content stays on-device.
+- `imessage.py` — reads `~/Library/Messages/chat.db` read-only (`immutable=1`, WAL-safe) → **Current Priorities** + **People Rules**. De-identified: phones masked to last-4, emails to a stable hash — **no names/emails/numbers written**, only derived summaries.
+- `gcal.py` — Google Calendar API (read-only OAuth) → real free/busy into **Availability** + `availability.json`.
+- `agent_context.py` — distills `~/.claude/projects/**/*.jsonl` → **Recent Agent Context** (how the owner prompts/delegates — the "learns" story).
+- `refresh.py` — one-command orchestrator; each source degrades independently (skip + reason, never crash).
+- `test_ingest.py` — 13 hermetic tests (synthetic data only). All pass, ruff + pyright clean.
+- `README.md` — runbook + per-source prerequisites + privacy notes.
+
+**Seam wired:** `bot-nemotron.py` now concatenates `load_persona_context()` into `system_instruction` (safe no-op until the file is populated).
+
+**Verified live:** iMessage (6k+ msgs, Ollama), Google Calendar (real free/busy), and agent context all refresh correctly into the right sections; confirmed no names/raw bodies leak. Prereqs to reproduce: Full Disk Access for the terminal, a local Ollama model (`ollama pull qwen2.5:7b`; deterministic fallback otherwise), and a Desktop Google OAuth `credentials.json` in `server/`. Secrets/artifacts gitignored: `credentials.json`, `token.json`, `availability.json`, `ingest_contacts.json`.
 
 **Cekura status / blockers:**
 
@@ -167,7 +177,9 @@ Acceptance:
 ```bash
 uv run python -m eval.run_evals              # baseline scorecard (mock)
 uv run python -m eval.improve --rounds 1     # THE DEMO: auto-improve loop
-uv run pytest eval/test_eval.py test_persona_context.py -q
+uv run python -m ingest.refresh              # Part B: pull live iMessage/Calendar/agent context
+uv run python -m ingest.refresh --dry-run    # ...preview without writing
+uv run pytest ingest/test_ingest.py eval/test_eval.py test_persona_context.py -q
 uv run python -m eval.cekura_client          # show Cekura mapping + key/auth check
 ```
 

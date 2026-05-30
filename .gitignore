@@ -227,3 +227,10 @@ pipecat-core-code/
 # Eval harness runtime outputs (Person 2)
 server/eval/results/
 server/eval/prompts/voicemail_agent_v[1-9]*.txt
+
+# Part B ingestion secrets + generated artifacts (Person 2) — never commit.
+# (No inline comments below: .gitignore treats trailing text as part of the pattern.)
+server/credentials.json
+server/token.json
+server/availability.json
+server/ingest_contacts.json
