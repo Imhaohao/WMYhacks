@@ -223,3 +223,7 @@ __marimo__/
 # Local reference checkout of pipecat source (read-only; runtime uses the
 # installed pipecat-ai package). It's a separate 182MB embedded git repo.
 pipecat-core-code/
+
+# Eval harness runtime outputs (Person 2)
+server/eval/results/
+server/eval/prompts/voicemail_agent_v[1-9]*.txt
