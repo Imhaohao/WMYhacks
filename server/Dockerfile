@@ -16,7 +16,7 @@ RUN --mount=type=cache,target=/root/.cache/uv \
     uv sync --locked --no-install-project --no-dev
 
 # Copy the application code
-# Pipecat Cloud expects the entry point at bot.py
+# Copy every local .py module so any cross-import resolves at runtime.
+COPY ./*.py ./
+# Pipecat Cloud expects the entry point at bot.py (kept last so it wins).
 COPY ./bot-nemotron.py bot.py
-COPY ./interfaces.py interfaces.py
-COPY ./nemotron_llm.py nemotron_llm.py

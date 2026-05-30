@@ -44,6 +44,7 @@ from pipecat.runner.types import (
     WebSocketRunnerArguments,
 )
 from pipecat.runner.utils import parse_telephony_websocket
+from pipecat.serializers.protobuf import ProtobufFrameSerializer
 from pipecat.serializers.twilio import TwilioFrameSerializer
 from pipecat.services.gradium.tts import GradiumTTSService
 from pipecat.services.llm_service import FunctionCallParams
@@ -68,7 +69,6 @@ from nemotron_llm import VLLMOpenAILLMService
 #   import calendar_tools   # P2 — appends book_callback_slot, get_calendar_availability
 from interfaces import TOOL_REGISTRY, CallState, build_system_instruction, default_call_state
 from nemotron_llm import VLLMOpenAILLMService
-from nvidia_stt import NVidiaWebSocketSTTService
 
 import persona_tools  # isort: skip  # P3 — appends 4 tools and on_call_finished hook
 
@@ -802,8 +802,24 @@ async def bot(runner_args: RunnerArguments):
                     audio_out_enabled=True,
                 ),
             )
+        case WebSocketRunnerArguments() if runner_args.transport_type == "websocket":
+            # Plain WebSocket (`/ws-client`) — a browser/JS test client sends
+            # binary Protobuf audio frames, NOT a Twilio JSON handshake. Do not
+            # call parse_telephony_websocket here: its iter_text() blows up with
+            # KeyError('text') on the first binary frame. 16 kHz like WebRTC.
+            serializer = ProtobufFrameSerializer()
+            transport = FastAPIWebsocketTransport(
+                websocket=runner_args.websocket,
+                params=FastAPIWebsocketParams(
+                    audio_in_enabled=True,
+                    audio_in_filter=krisp_filter,
+                    audio_out_enabled=True,
+                    serializer=serializer,
+                ),
+            )
         case WebSocketRunnerArguments():
-            transport_overrides["audio_in_sample_rate"] = 8000
+            # Telephony (`/ws`) — Twilio Media Streams, 8 kHz mulaw, JSON handshake.
+            transport_overrides["audio_in_sample_rate"] = 16000
             transport_overrides["audio_out_sample_rate"] = 8000
 
             _, call_data = await parse_telephony_websocket(runner_args.websocket)
