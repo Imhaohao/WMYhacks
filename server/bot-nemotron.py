@@ -4,23 +4,21 @@
 # SPDX-License-Identifier: BSD 2-Clause License
 #
 
-"""Field & Flower — flower shop voice ordering bot (hackathon starter).
+"""Personal voicemail agent — Nemotron voice path (hackathon build).
 
-A customer calls in and the bot helps them pick a bouquet and arrange delivery.
-All backend calls (catalog, customer lookup, order placement) are mocked so the
-starter runs with no external dependencies beyond the AI services.
+The bot answers inbound calls on the owner's behalf, takes a complete message,
+and routes it via Twilio SMS and/or Gmail.  Calendar callbacks and caller-persona
+enrichment are handled by P2 and P3 modules that append to TOOL_REGISTRY in
+server/interfaces.py.
 
-Pipeline: Nemotron Speech Streaming STT → Nemotron-3-Super-120B LLM → Gradium TTS, with direct
-function tools registered on the LLM context.
+Pipeline: Nemotron STT → Nemotron-3-Super-120B LLM → Gradium (cloned-voice) TTS
 
-Run the bot using::
+Run locally::
 
-    uv run bot-nemotron.py
+    ENV=local uv run bot-nemotron.py
 """
 
 import os
-import random
-from datetime import date
 
 import aiohttp
 from dotenv import load_dotenv
@@ -52,54 +50,149 @@ from pipecat.transports.websocket.fastapi import FastAPIWebsocketParams, FastAPI
 from pipecat.turns.user_turn_strategies import FilterIncompleteUserTurnStrategies
 from pipecat.workers.runner import WorkerRunner
 
-from mock_backend import BOUQUETS, KNOWN_CUSTOMERS
+from interfaces import TOOL_REGISTRY, CallState, build_system_instruction, default_call_state
 from nemotron_llm import VLLMOpenAILLMService
 from nvidia_stt import NVidiaWebSocketSTTService
+
+# ── P2 / P3 modules append to TOOL_REGISTRY at import time ────────────────────
+# Add an import line here once each teammate's module is ready:
+#   import calendar_tools   # P2 — appends book_callback_slot, get_calendar_availability
+#   import persona_tools    # P3 — appends update_caller_snapshot, lookup_persona
 
 load_dotenv(override=True)
 
 
+# ─── Twilio helper ────────────────────────────────────────────────────────────
+
+
 async def get_call_info(call_sid: str) -> dict:
-    """Fetch call information from Twilio REST API using aiohttp.
-
-    Args:
-        call_sid: The Twilio call SID
-
-    Returns:
-        Dictionary containing call information including from_number, to_number, status, etc.
-    """
+    """Fetch caller number from Twilio REST API."""
     account_sid = os.getenv("TWILIO_ACCOUNT_SID")
     auth_token = os.getenv("TWILIO_AUTH_TOKEN")
-
     if not account_sid or not auth_token:
         logger.warning("Missing Twilio credentials, cannot fetch call info")
         return {}
-
     url = f"https://api.twilio.com/2010-04-01/Accounts/{account_sid}/Calls/{call_sid}.json"
-
     try:
-        # Use HTTP Basic Auth with aiohttp
-        auth = aiohttp.BasicAuth(account_sid, auth_token)
-
         async with aiohttp.ClientSession() as session:
-            async with session.get(url, auth=auth) as response:
-                if response.status != 200:
-                    error_text = await response.text()
-                    logger.error(f"Twilio API error ({response.status}): {error_text}")
+            async with session.get(url, auth=aiohttp.BasicAuth(account_sid, auth_token)) as resp:
+                if resp.status != 200:
+                    logger.error(f"Twilio API error ({resp.status}): {await resp.text()}")
                     return {}
-
-                data = await response.json()
-
-                call_info = {
-                    "from_number": data.get("from"),
-                    "to_number": data.get("to"),
-                }
-
-                return call_info
-
-    except Exception as e:
-        logger.error(f"Error fetching call info from Twilio: {e}")
+                data = await resp.json()
+                return {"from_number": data.get("from"), "to_number": data.get("to")}
+    except Exception as exc:
+        logger.error(f"Error fetching Twilio call info: {exc}")
         return {}
+
+
+# ─── P1 core voicemail tools ──────────────────────────────────────────────────
+# These are the baseline tools P1 owns. P2 and P3 append theirs to TOOL_REGISTRY
+# from their own modules (see import block above).
+
+
+async def record_message(
+    params: FunctionCallParams,
+    call_state: CallState,
+    caller_name: str,
+    callback_number: str,
+    subject: str,
+    urgency: str = "normal",
+) -> None:
+    """Record the caller's complete message into call_state.
+
+    Call this once you have collected the caller's name, callback number,
+    subject, and urgency level. Do NOT call it until all four are confirmed.
+
+    Args:
+        caller_name: The caller's name as they stated it.
+        callback_number: The phone number the caller wants the owner to call back.
+        subject: One-sentence summary of why they called.
+        urgency: "urgent" | "normal" | "low". Default "normal".
+    """
+    call_state["voicemail"]["action_items"].append(
+        f"[{urgency.upper()}] Call back {caller_name} at {callback_number} re: {subject}"
+    )
+    logger.info(
+        f"Message recorded — caller={caller_name} cb={callback_number} "
+        f"urgency={urgency} subject={subject}"
+    )
+    await params.result_callback(
+        {
+            "ok": True,
+            "recorded": {
+                "caller_name": caller_name,
+                "callback_number": callback_number,
+                "subject": subject,
+                "urgency": urgency,
+            },
+        }
+    )
+
+
+async def notify_owner_sms(
+    params: FunctionCallParams,
+    call_state: CallState,
+    message_body: str,
+) -> None:
+    """Send a Twilio SMS to the owner summarising the voicemail.
+
+    Call this after record_message has confirmed the message. Use only when
+    urgency is "urgent" or when the caller explicitly asks for immediate
+    notification. For normal messages, the owner checks their inbox.
+
+    Args:
+        message_body: The SMS text to send. Keep it under 160 chars.
+            Example: "New voicemail from Alex (+14155551234): urgent — needs
+            callback re: contract renewal."
+    """
+    account_sid = os.getenv("TWILIO_ACCOUNT_SID")
+    auth_token = os.getenv("TWILIO_AUTH_TOKEN")
+    owner_number = os.getenv("OWNER_PHONE_NUMBER")
+    twilio_number = os.getenv("TWILIO_PHONE_NUMBER")
+
+    if not all([account_sid, auth_token, owner_number, twilio_number]):
+        logger.warning("Twilio SMS not configured — skipping owner notification")
+        call_state["voicemail"]["sms_sent"] = False
+        await params.result_callback({"ok": False, "reason": "SMS not configured"})
+        return
+
+    url = f"https://api.twilio.com/2010-04-01/Accounts/{account_sid}/Messages.json"
+    try:
+        async with aiohttp.ClientSession() as session:
+            async with session.post(
+                url,
+                auth=aiohttp.BasicAuth(account_sid, auth_token),  # type: ignore[arg-type]
+                data={"From": twilio_number, "To": owner_number, "Body": message_body},
+            ) as resp:
+                if resp.status not in (200, 201):
+                    logger.error(f"SMS send failed ({resp.status}): {await resp.text()}")
+                    await params.result_callback({"ok": False, "reason": "Twilio error"})
+                    return
+                call_state["voicemail"]["sms_sent"] = True
+                logger.info(f"Owner SMS sent: {message_body}")
+                await params.result_callback({"ok": True})
+    except Exception as exc:
+        logger.error(f"SMS error: {exc}")
+        await params.result_callback({"ok": False, "reason": str(exc)})
+
+
+async def end_call(params: FunctionCallParams) -> None:
+    """End the call. Only call this AFTER you have said goodbye to the caller
+    in the same turn. The pipeline flushes any queued speech, then hangs up."""
+    logger.info("end_call — pushing EndTaskFrame upstream")
+    await params.llm.push_frame(EndTaskFrame(), FrameDirection.UPSTREAM)
+    await params.result_callback(
+        {"ok": True}, properties=FunctionCallResultProperties(run_llm=False)
+    )
+
+
+# Seed TOOL_REGISTRY with P1's tools.
+# P2 / P3 append theirs at module import time (see imports above).
+TOOL_REGISTRY.extend([record_message, notify_owner_sms, end_call])
+
+
+# ─── Main bot ─────────────────────────────────────────────────────────────────
 
 
 async def run_bot(
@@ -107,279 +200,67 @@ async def run_bot(
     from_number: str | None = None,
     audio_in_sample_rate: int = 16000,
     audio_out_sample_rate: int = 24000,
-):
-    """Main bot logic.
+) -> None:
+    """Wire up the Pipecat pipeline for one call.
 
     Args:
-        transport: The transport to use.
-        from_number: Caller's phone number (Twilio path only) for known-customer lookup.
-        audio_in_sample_rate: Input audio sample rate in Hz. Defaults to 16000 (WebRTC).
-        audio_out_sample_rate: Output audio sample rate in Hz. Defaults to 24000 (WebRTC).
+        transport: SmallWebRTC (local) or FastAPIWebsocket (Twilio).
+        from_number: E.164 caller number from Twilio, or None for WebRTC.
+        audio_in_sample_rate: 16 kHz (WebRTC) or 8 kHz (Twilio mulaw).
+        audio_out_sample_rate: 24 kHz (WebRTC) or 8 kHz (Twilio mulaw).
     """
-    logger.info("Starting bot")
+    logger.info("Starting voicemail bot")
 
-    # Per-call order state. Closed over by the tool functions below so each
-    # call gets its own isolated order.
-    order: dict = {"items": [], "delivery": None}
+    # One CallState per call — closed over by all tool closures below.
+    call_state = default_call_state(caller_number=from_number or "")
 
-    # --- Tools the LLM can call ---------------------------------------------
-
-    async def list_bouquets(
-        params: FunctionCallParams,
-        occasion: str | None = None,
-        specials_only: bool = False,
-    ) -> None:
-        """List bouquets available today. Optionally filter by occasion or by
-        what's currently on special.
-
-        Use this when the caller asks what's available, mentions a specific
-        occasion ("it's for my mom's birthday", "for Valentine's Day", "for a
-        funeral"), or asks about specials/deals. Sold-out bouquets are
-        automatically excluded from results.
-
-        Args:
-            occasion: Lowercase occasion to filter by. Common values:
-                "birthday", "anniversary", "valentine's day", "mother's day",
-                "sympathy", "wedding", "graduation", "thank you", "get well",
-                "new baby", "housewarming", "christmas", "easter", "just
-                because". Pass the canonical short form ("birthday", not "mom's
-                birthday"). Omit to return the full catalog.
-            specials_only: If True, only return bouquets currently on special.
-        """
-        results = []
-        for name, info in BOUQUETS.items():
-            if not info["in_stock"]:
-                continue
-            if specials_only and not info.get("on_special", False):
-                continue
-            if occasion is not None:
-                occ = occasion.strip().lower()
-                tags = [o.lower() for o in info.get("occasions", [])]
-                if not any(occ in tag or tag in occ for tag in tags):
-                    continue
-            results.append({"name": name, **info})
-
-        if not results and (occasion is not None or specials_only):
-            await params.result_callback(
-                {
-                    "bouquets": [],
-                    "note": (
-                        "No bouquets match those filters. Tell the caller you don't have "
-                        "anything specifically for that, and offer to browse the full "
-                        "catalog or try a different angle."
-                    ),
-                }
-            )
-            return
-
-        await params.result_callback({"bouquets": results})
-
-    async def check_availability(params: FunctionCallParams, bouquet_name: str) -> None:
-        """Check whether a specific bouquet is in stock today.
-
-        Args:
-            bouquet_name: The name of the bouquet to check, lowercase.
-        """
-        item = BOUQUETS.get(bouquet_name.lower())
-        if not item:
-            await params.result_callback(
-                {"available": False, "reason": f"We don't carry a bouquet called '{bouquet_name}'."}
-            )
-            return
-        if not item["in_stock"]:
-            await params.result_callback(
-                {"available": False, "reason": f"{bouquet_name} is sold out today."}
-            )
-            return
-        await params.result_callback({"available": True, "price": item["price"]})
-
-    async def add_to_order(
-        params: FunctionCallParams, bouquet_name: str, quantity: int = 1
-    ) -> None:
-        """Add a bouquet to the customer's order. Only call this after the
-        customer has confirmed they want this bouquet.
-
-        Args:
-            bouquet_name: The name of the bouquet to add, lowercase.
-            quantity: How many of this bouquet to add. Defaults to 1.
-        """
-        item = BOUQUETS.get(bouquet_name.lower())
-        if not item:
-            await params.result_callback(
-                {"ok": False, "reason": f"We don't carry a bouquet called '{bouquet_name}'."}
-            )
-            return
-        if not item["in_stock"]:
-            await params.result_callback(
-                {"ok": False, "reason": f"{bouquet_name} is sold out today."}
-            )
-            return
-        order["items"].append(
-            {"bouquet": bouquet_name.lower(), "quantity": quantity, "price": item["price"]}
-        )
-        await params.result_callback({"ok": True, "items": order["items"]})
-
-    async def get_order_summary(params: FunctionCallParams) -> None:
-        """Read back the current order: items, quantities, and running total."""
-        total = sum(line["price"] * line["quantity"] for line in order["items"])
-        await params.result_callback(
-            {"items": order["items"], "total": round(total, 2), "delivery": order["delivery"]}
-        )
-
-    async def set_delivery_details(
-        params: FunctionCallParams,
-        recipient_name: str,
-        address: str,
-        delivery_date: str,
-    ) -> None:
-        """Capture delivery details for the order.
-
-        Args:
-            recipient_name: Name of the person receiving the flowers.
-            address: Delivery street address.
-            delivery_date: Requested delivery date, in the customer's own words
-                (e.g. "Friday", "May 20th"). No parsing required.
-        """
-        order["delivery"] = {
-            "recipient_name": recipient_name,
-            "address": address,
-            "delivery_date": delivery_date,
-        }
-        await params.result_callback({"ok": True, "delivery": order["delivery"]})
-
-    async def place_order(params: FunctionCallParams) -> None:
-        """Finalize the order. Only call this after the customer has confirmed
-        the items AND delivery details."""
-        if not order["items"]:
-            await params.result_callback({"ok": False, "reason": "No items in the order yet."})
-            return
-        if not order["delivery"]:
-            await params.result_callback({"ok": False, "reason": "Missing delivery details."})
-            return
-        total = sum(line["price"] * line["quantity"] for line in order["items"])
-        confirmation = f"FLW-{random.randint(100000, 999999)}"
-        logger.info(f"Order placed: {confirmation} total=${total:.2f} order={order}")
-        await params.result_callback(
-            {
-                "ok": True,
-                "confirmation_number": confirmation,
-                "total": round(total, 2),
-                "eta": "within 2 business days",
-            }
-        )
-
-    async def end_call(params: FunctionCallParams) -> None:
-        """End the call. Only call this AFTER you have said goodbye to the
-        customer in the same turn. The pipeline will flush any queued speech
-        and then hang up."""
-        logger.info("end_call invoked — pushing EndTaskFrame upstream")
-        await params.llm.push_frame(EndTaskFrame(), FrameDirection.UPSTREAM)
-        # run_llm=False prevents the LLM from generating a follow-up response
-        # after this function returns — the goodbye should already be in flight.
-        await params.result_callback(
-            {"ok": True}, properties=FunctionCallResultProperties(run_llm=False)
-        )
-
-    tool_functions = [
-        list_bouquets,
-        check_availability,
-        add_to_order,
-        get_order_summary,
-        set_delivery_details,
-        place_order,
-        end_call,
-    ]
-    tools = ToolsSchema(standard_tools=tool_functions)
-
-    # --- System instruction (varies based on caller ID) ---------------------
-
-    customer = KNOWN_CUSTOMERS.get(from_number or "")
-    if customer:
-        caller_context = (
-            f"This caller is a returning customer (caller ID matched). On file: "
-            f"name {customer['name']}, last order the {customer['last_order']} bouquet. "
-            'Greet them generically: "Welcome back to Field & Flower! How can I help '
-            'today?" Do not use their name or mention their last order in the greeting; '
-            "that comes across as surveilling. Once they say they want flowers, you "
-            "can offer their last order as a helpful shortcut, framed as record-keeping: "
-            f'"I have you down for the {customer["last_order"]} last time, want that '
-            'again or something different?" Always give them the alternative.'
-        )
-    else:
-        caller_context = (
-            "You're talking to a new customer. Introduce the shop briefly and ask how you can help."
-        )
-
-    system_instruction = (
-        "You are a friendly order-taker for Field & Flower, a neighborhood flower shop. "
-        "Help callers pick a bouquet and arrange delivery. Use the tools to look up "
-        "bouquets, check stock, add items, capture delivery details, and place the order. "
-        "Confirm the full order before calling place_order.\n\n"
-        "Talk like a real shop clerk on the phone — not a chatbot:\n"
-        "- Keep it to 1–2 short sentences per turn. Longer only when listing options or "
-        "doing the final order read-back.\n"
-        "- Ask ONE thing at a time. Don't ask for name, address, and date in one breath — "
-        "ask for the name, wait, then the next.\n"
-        '- Skip filler openers like "Absolutely!", "That sounds lovely!", "Perfect!", '
-        '"I\'d be happy to" — go straight to the point.\n'
-        "- Describe bouquets plainly. \"A dozen red roses with baby's breath, sixty-five "
-        'dollars." Not "a classic, romantic bouquet showing love and appreciation."\n'
-        "- When listing bouquets, ALWAYS lead with the bouquet's name. Format: "
-        '"<Name> — <description>, <price>." For example: "Spring Sunshine — yellow tulips '
-        'and daffodils, forty-five dollars." The name is how the caller refers back to it.\n'
-        "- When the caller mentions an occasion (birthday, Mother's Day, anniversary, "
-        "sympathy, etc.) or asks about specials/deals, pass those as filters to "
-        'list_bouquets (occasion="..." or specials_only=True) instead of reading the '
-        "full catalog. Don't list 15 bouquets when 3 are relevant.\n"
-        "- The catalog has many options — when listing, name at most 4 or 5 at a time. "
-        "If the caller doesn't bite, offer to share more.\n"
-        "- Don't restate what the customer just said back to them, except in the final "
-        "order confirmation.\n"
-        "- Use contractions. Fragments are fine.\n\n"
-        "Responses are spoken aloud. No bullet points, no emojis. Read prices in words "
-        '("forty-five dollars", not "$45.00").\n\n'
-        "When the order is placed and the customer has no more requests, or when they say "
-        'goodbye: say a short closing line (e.g. "Thanks, have a great day!") AND call '
-        "end_call in the same turn. Never call end_call without saying goodbye first.\n\n"
-        f"Today is {date.today().strftime('%A, %B %d, %Y')}. Use this when the caller "
-        'gives a relative delivery date like "this Friday" or "next Tuesday".\n\n'
-        f"Caller context: {caller_context}"
-    )
-
-    # Speech-to-Text service
+    # ── Bind call_state into tools that need it ───────────────────────────────
+    # TOOL_REGISTRY entries that accept a `call_state` parameter get a closure
+    # wrapping them so the LLM sees the simpler (no call_state) signature while
+    # the implementation still mutates the per-call dict.
     #
-    # Nemotron Speech Streaming STT, served over WebSocket. The server expects
-    # 16-bit PCM, 16 kHz, mono — matching the WebRTC input path. The URL can be
-    # overridden via NVIDIA_ASR_URL.
+    # Convention: if a tool's first non-params arg is named `call_state` and
+    # typed CallState, wrap it here. P2/P3 should follow the same pattern in
+    # their modules.
+
+    import functools
+    import inspect
+
+    def bind_call_state(fn):
+        """Wrap a tool whose second param is `call_state` so Pipecat sees the
+        correct signature: first param named `params`, no `call_state` param."""
+        sig = inspect.signature(fn)
+        param_names = list(sig.parameters.keys())
+        if len(param_names) > 1 and param_names[1] == "call_state":
+            @functools.wraps(fn)
+            async def bound(params, **kwargs):
+                return await fn(params, call_state=call_state, **kwargs)
+            # Drop `call_state` from the visible signature so Pipecat's schema
+            # generator doesn't try to inject it as an LLM argument.
+            new_params = [p for k, p in sig.parameters.items() if k != "call_state"]
+            bound.__signature__ = sig.replace(parameters=new_params)
+            return bound
+        return fn
+
+    bound_tools = [bind_call_state(fn) for fn in TOOL_REGISTRY]
+
+    # ── P2: inject persona_context before building system instruction ──────────
+    # TODO (P2): populate call_state["persona_context"] here by calling your
+    #   calendar / iMessage analysis functions, e.g.:
+    #       call_state["persona_context"] = await fetch_owner_context(from_number)
+    # The build_system_instruction() call below will embed it automatically.
+
+    system_instruction = build_system_instruction(call_state)
+
+    # ── Services ──────────────────────────────────────────────────────────────
     stt = NVidiaWebSocketSTTService(
         url=os.getenv("NVIDIA_ASR_URL", "ws://192.168.7.228:8081"),
         strip_interim_prefix=True,
     )
 
-    # LLM service — Nemotron-3-Super-120B served by vLLM (OpenAI-compatible chat
-    # completions at /v1). vLLM exposes the Chat Completions API, not the Responses
-    # API, so we use OpenAILLMService (not OpenAIResponsesLLMService). The live
-    # endpoint serves the model as "nemotron-3-super" (per its /v1/models).
-    #
-    # Reasoning ("thinking") toggle — Nemotron is controlled per-request via
-    # chat_template_kwargs.enable_thinking, forwarded through the OpenAI client's
-    # extra_body (the request-body convention confirmed against this endpoint in
-    # ../aiewf-eval traces). Default OFF for low-latency voice. To ENABLE, set
-    # NEMOTRON_ENABLE_THINKING=true; to DISABLE, leave unset/false.
-    #
-    # CAUTION for voice: reasoning is only kept out of the spoken `content` if the
-    # vLLM server runs a reasoning parser (e.g. --reasoning-parser nemotron_v3, which
-    # routes it to a separate `reasoning_content` field). This live endpoint did NOT
-    # surface reasoning_content in testing, so if thinking is enabled and the server
-    # lacks a parser, chain-of-thought would appear inline in `content` and get
-    # spoken. Keep thinking OFF for voice unless the parser is confirmed active.
-    # VLLMOpenAILLMService is a thin OpenAILLMService subclass that reports TTFB to
-    # the first NON-THINKING token (so the metric reflects time-to-first-spoken-word
-    # when reasoning is enabled, not time-to-first-reasoning-token). No-op when
-    # thinking is off. See server/nemotron_llm.py.
     enable_thinking = os.getenv("NEMOTRON_ENABLE_THINKING", "false").lower() == "true"
     llm = VLLMOpenAILLMService(
-        api_key=os.getenv("NEMOTRON_LLM_API_KEY", "EMPTY"),  # vLLM ignores unless --api-key set
+        api_key=os.getenv("NEMOTRON_LLM_API_KEY", "EMPTY"),
         base_url=os.getenv("NEMOTRON_LLM_URL", "http://192.168.7.228:8000/v1"),
         settings=VLLMOpenAILLMService.Settings(
             model=os.getenv("NEMOTRON_LLM_MODEL", "nvidia/nemotron-3-super"),
@@ -388,7 +269,6 @@ async def run_bot(
         ),
     )
 
-    # Text-to-Speech service
     tts = GradiumTTSService(
         api_key=os.environ["GRADIUM_API_KEY"],
         settings=GradiumTTSService.Settings(
@@ -396,9 +276,8 @@ async def run_bot(
         ),
     )
 
-    # ToolsSchema describes the tools to the LLM; register_direct_function
-    # wires the actual handlers the LLM will invoke. Both are required.
-    for fn in tool_functions:
+    tools = ToolsSchema(standard_tools=bound_tools)
+    for fn in bound_tools:
         llm.register_direct_function(fn)
 
     context = LLMContext(tools=tools)
@@ -410,7 +289,6 @@ async def run_bot(
         ),
     )
 
-    # Pipeline - assembled from reusable components
     pipeline = Pipeline(
         [
             transport.input(),
@@ -436,36 +314,36 @@ async def run_bot(
     @transport.event_handler("on_client_connected")
     async def on_client_connected(transport, client):
         logger.info("Client connected")
-        # Kick off the conversation
         context.add_message(
             {
                 "role": "user",
-                "content": "A customer just called. Greet them, 'This is Field & Flower, your local flower shop. How can I help you today?'",
+                "content": (
+                    "A caller just connected. Greet them warmly and ask how you can help."
+                ),
             }
         )
         await worker.queue_frames([LLMRunFrame()])
 
     @transport.event_handler("on_client_disconnected")
     async def on_client_disconnected(transport, client):
-        logger.info("Client disconnected")
+        logger.info(f"Client disconnected — call_state summary: {call_state['voicemail']}")
         await worker.cancel()
 
     runner = WorkerRunner(handle_sigint=False)
-
     await runner.add_workers(worker)
     await runner.run()
 
 
-async def bot(runner_args: RunnerArguments):
-    """Main bot entry point."""
+# ─── Entry point ──────────────────────────────────────────────────────────────
 
+
+async def bot(runner_args: RunnerArguments):
+    """Pipecat entry point — routes WebRTC vs Twilio transports."""
     from_number: str | None = None
     transport_overrides: dict = {}
 
-    # Krisp is available when deployed to Pipecat Cloud
     if os.environ.get("ENV") != "local":
         from pipecat.audio.filters.krisp_viva_filter import KrispVivaFilter
-
         krisp_filter = KrispVivaFilter()
     else:
         krisp_filter = None
@@ -473,7 +351,6 @@ async def bot(runner_args: RunnerArguments):
     match runner_args:
         case SmallWebRTCRunnerArguments():
             webrtc_connection: SmallWebRTCConnection = runner_args.webrtc_connection
-
             transport = SmallWebRTCTransport(
                 webrtc_connection=webrtc_connection,
                 params=TransportParams(
@@ -483,20 +360,14 @@ async def bot(runner_args: RunnerArguments):
                 ),
             )
         case WebSocketRunnerArguments():
-            # Twilio media streams are 8 kHz μ-law in both directions.
-            # This overrides the default sample rates: 16 kHz in / 24 kHz out.
             transport_overrides["audio_in_sample_rate"] = 8000
             transport_overrides["audio_out_sample_rate"] = 8000
 
-            # Parse Twilio websocket and fetch call information
             _, call_data = await parse_telephony_websocket(runner_args.websocket)
-
-            # Fetch call information from Twilio REST API so we can personalize
-            # the bot for known customers (see KNOWN_CUSTOMERS).
             call_info = await get_call_info(call_data["call_id"])
             if call_info:
                 from_number = call_info.get("from_number")
-                logger.info(f"Call from: {from_number} to: {call_info.get('to_number')}")
+                logger.info(f"Call from {from_number} to {call_info.get('to_number')}")
 
             serializer = TwilioFrameSerializer(
                 stream_sid=call_data["stream_id"],
@@ -504,7 +375,6 @@ async def bot(runner_args: RunnerArguments):
                 account_sid=os.getenv("TWILIO_ACCOUNT_SID", ""),
                 auth_token=os.getenv("TWILIO_AUTH_TOKEN", ""),
             )
-
             transport = FastAPIWebsocketTransport(
                 websocket=runner_args.websocket,
                 params=FastAPIWebsocketParams(
@@ -516,7 +386,7 @@ async def bot(runner_args: RunnerArguments):
                 ),
             )
         case _:
-            logger.error(f"Unsupported runner arguments type: {type(runner_args)}")
+            logger.error(f"Unsupported runner type: {type(runner_args)}")
             return
 
     await run_bot(transport, from_number=from_number, **transport_overrides)
