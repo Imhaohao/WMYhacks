@@ -326,6 +326,26 @@ def on_call_finished(call_state: CallState) -> str | None:
         )
         record_id = record.get("record_id")
         logger.info(f"P3 on_call_finished: persisted {record_id} via {persistence.backend_kind()}")
+
+        # Index this call by caller and expand their cumulative profile. Keyed by
+        # phone number; grows a little with every call. Isolated so a profile
+        # failure never loses the voicemail record we just wrote.
+        try:
+            vm: dict[str, Any] = dict(call_state["voicemail"])  # type: ignore[arg-type]
+            msg: dict[str, Any] = dict(vm.get("message") or {})
+            persistence.upsert_caller_profile(
+                vm.get("caller_number"),
+                caller_name=msg.get("caller_name"),
+                reason=msg.get("reason"),
+                urgency=msg.get("urgency"),
+                callback_number=msg.get("callback_number"),
+                summary=vm.get("summary"),
+                persona_id=snap.get("persona_id"),
+                call_record_id=record_id,
+            )
+        except Exception as exc:
+            logger.error(f"P3 on_call_finished: caller profile skipped — {exc}")
+
         return record_id
     except Exception as exc:
         logger.error(f"P3 on_call_finished: persistence skipped — {exc}")

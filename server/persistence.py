@@ -54,6 +54,7 @@ load_dotenv(_ENV_DIR / ".env.local", override=True)
 # Record type tags.
 TYPE_VOICEMAIL = "voicemail"
 TYPE_EVAL_RUN = "eval_run"
+TYPE_CALLER_PROFILE = "caller_profile"
 
 _DEFAULT_LOCAL_PATH = Path(__file__).parent / "aws_store" / "records.jsonl"
 
@@ -214,6 +215,9 @@ def persist_voicemail(
     record = {
         "record_id": str(uuid.uuid4()),
         "type": TYPE_VOICEMAIL,
+        # Hoisted to the top level so calls are indexable by caller (see
+        # list_calls_for_caller / upsert_caller_profile).
+        "caller_number": _normalize_number((voicemail or {}).get("caller_number")),
         "owner_context_tag": _owner_tag(owner_context_tag),
         "timestamp": _now_iso(),
         "caller_snapshot": _strip_internal(caller_snapshot or {}),
@@ -258,6 +262,127 @@ def persist_eval_run(
     record["_stored_at"] = where
     logger.info(f"Persisted eval_run {record['record_id']} -> {where}")
     return record
+
+
+# --- Per-caller profiles ----------------------------------------------------
+
+def _normalize_number(number: str | None) -> str:
+    """Canonical key for a caller so the same phone maps to one profile.
+
+    Keeps only digits and a leading ``+``; everything else (spaces, dashes,
+    parentheses) is dropped. Empty/None → "" (an anonymous, non-indexable call)."""
+    if not number:
+        return ""
+    cleaned = "".join(ch for ch in number.strip() if ch.isdigit() or ch == "+")
+    return cleaned
+
+
+def get_caller_profile(caller_number: str | None) -> dict[str, Any] | None:
+    """Return the current accumulated profile for a caller, or None if unknown.
+
+    Resolved from the newest ``caller_profile`` record for this number. On
+    DynamoDB the record upserts in place; the local file keeps one version per
+    call, so we take the latest by timestamp."""
+    key = _normalize_number(caller_number)
+    if not key:
+        return None
+    matches = [
+        r
+        for r in _get_backend().read_all(TYPE_CALLER_PROFILE)
+        if _normalize_number(r.get("caller_number")) == key
+    ]
+    if not matches:
+        return None
+    return max(matches, key=lambda r: r.get("timestamp", ""))
+
+
+def list_calls_for_caller(caller_number: str | None) -> list[dict[str, Any]]:
+    """Every voicemail record left by this caller, newest first."""
+    key = _normalize_number(caller_number)
+    if not key:
+        return []
+    calls = [
+        r
+        for r in _get_backend().read_all(TYPE_VOICEMAIL)
+        if _normalize_number(
+            r.get("caller_number") or (r.get("voicemail") or {}).get("caller_number")
+        )
+        == key
+    ]
+    calls.sort(key=lambda r: r.get("timestamp", ""), reverse=True)
+    return calls
+
+
+def upsert_caller_profile(
+    caller_number: str | None,
+    *,
+    caller_name: str | None = None,
+    reason: str | None = None,
+    urgency: str | None = None,
+    callback_number: str | None = None,
+    summary: str | None = None,
+    persona_id: str | None = None,
+    call_record_id: str | None = None,
+) -> dict[str, Any] | None:
+    """Create or expand the per-caller profile at end of call.
+
+    Indexed by phone number and grows on every call: call count, names seen,
+    topics, urgency history, callback numbers, and recent summaries. Stored with
+    ``record_id`` = the normalized number, so DynamoDB upserts the single profile
+    item in place while the local file appends a new version (latest wins on
+    read). Never raises.
+
+    Returns the updated profile, or None for an anonymous caller (no number to
+    index by — e.g. withheld caller ID or a local WebRTC test)."""
+    key = _normalize_number(caller_number)
+    if not key:
+        logger.info("caller profile: no caller number — skipping (anonymous call)")
+        return None
+
+    now = _now_iso()
+    prior = get_caller_profile(key) or {}
+
+    def _append_unique(seq: Any, value: Any, cap: int = 50) -> list[Any]:
+        out = list(seq or [])
+        if value and value not in out:
+            out.append(value)
+        return out[-cap:]
+
+    def _append(seq: Any, value: Any, cap: int) -> list[Any]:
+        out = list(seq or [])
+        if value:
+            out.append(value)
+        return out[-cap:]
+
+    profile = {
+        "record_id": key,  # stable key → DynamoDB upserts in place
+        "type": TYPE_CALLER_PROFILE,
+        "caller_number": key,
+        "timestamp": now,  # last updated
+        "first_seen": prior.get("first_seen") or now,
+        "last_seen": now,
+        "call_count": int(prior.get("call_count", 0)) + 1,
+        "display_name": caller_name or prior.get("display_name") or "",
+        "names": _append_unique(prior.get("names"), caller_name),
+        "topics": _append(prior.get("topics"), reason, cap=30),
+        "urgency_history": _append(prior.get("urgency_history"), urgency, cap=30),
+        "callback_numbers": _append_unique(prior.get("callback_numbers"), callback_number),
+        "persona_ids": _append_unique(prior.get("persona_ids"), persona_id),
+        "recent_summaries": _append(prior.get("recent_summaries"), summary, cap=10),
+        "call_ids": _append_unique(prior.get("call_ids"), call_record_id, cap=200),
+    }
+
+    try:
+        where = _get_backend().write(profile)
+    except Exception as e:  # absolute last-resort guard
+        logger.error(f"upsert_caller_profile failed hard: {type(e).__name__}: {e}")
+        where = "unwritten"
+    profile["_stored_at"] = where
+    logger.info(
+        f"Caller profile {key}: call #{profile['call_count']} "
+        f"(name={profile['display_name']!r}) -> {where}"
+    )
+    return profile
 
 
 def list_records(record_type: str | None = None) -> list[dict[str, Any]]:
