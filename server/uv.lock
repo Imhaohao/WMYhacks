@@ -3149,13 +3149,9 @@ name = "yc-voice-agent-hackathon"
 version = "0.1.0"
 source = { virtual = "." }
 dependencies = [
-<<<<<<< HEAD
     { name = "boto3" },
     { name = "fastapi" },
-    { name = "pipecat-ai", extra = ["gradium", "openai", "runner", "webrtc", "websocket"] },
-=======
-    { name = "pipecat-ai", extra = ["daily", "gradium", "openai", "runner", "webrtc", "websocket"] },
->>>>>>> adbbfa0 (everything but phone)
+    { name = "pipecat-ai", extra = ["gradium", "openai", "runner", "webrtc", "websocket", "daily"] },
     { name = "pipecatcloud" },
     { name = "python-dotenv" },
     { name = "python-multipart" },
