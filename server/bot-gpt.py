@@ -52,7 +52,6 @@ from pipecat.transports.base_transport import BaseTransport, TransportParams
 from pipecat.transports.smallwebrtc.connection import SmallWebRTCConnection
 from pipecat.transports.smallwebrtc.transport import SmallWebRTCTransport
 from pipecat.transports.websocket.fastapi import FastAPIWebsocketParams, FastAPIWebsocketTransport
-from pipecat.turns.user_turn_strategies import FilterIncompleteUserTurnStrategies
 from pipecat.workers.runner import WorkerRunner
 
 from mock_backend import BOUQUETS, KNOWN_CUSTOMERS
@@ -378,11 +377,17 @@ async def run_bot(
         llm.register_direct_function(fn)
 
     context = LLMContext(tools=tools)
+    # Turn-taking: use Pipecat's default stop strategy (LocalSmartTurnAnalyzerV3),
+    # a prosody-based end-of-turn model that finalizes in ~tens of ms. We do NOT use
+    # FilterIncompleteUserTurnStrategies here: that LLM-judged gate suppresses the
+    # reply and sits silent for incomplete_short_timeout (5s) / incomplete_long_timeout
+    # (10s) whenever it marks a turn ○/◐ "incomplete", adding multi-second latency to
+    # nearly every response. The smart-turn analyzer still avoids cutting callers off
+    # mid-sentence, without the per-turn LLM round-trip or silent waits.
     user_aggregator, assistant_aggregator = LLMContextAggregatorPair(
         context,
         user_params=LLMUserAggregatorParams(
             vad_analyzer=SileroVADAnalyzer(),
-            user_turn_strategies=FilterIncompleteUserTurnStrategies(),
         ),
     )
 
