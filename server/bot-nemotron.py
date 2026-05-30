@@ -11,7 +11,7 @@ and routes it via Twilio SMS and/or Gmail.  Calendar callbacks and caller-person
 enrichment are handled by P2 and P3 modules that append to TOOL_REGISTRY in
 server/interfaces.py.
 
-Pipeline: Nemotron STT → Nemotron-3-Super-120B LLM → Gradium (cloned-voice) TTS
+Pipeline: Gradium STT → Nemotron-3-Super-120B LLM → Gradium (cloned-voice) TTS
 
 Run locally::
 
@@ -57,6 +57,11 @@ from pipecat.workers.runner import WorkerRunner
 _ENV_DIR = Path(__file__).resolve().parent
 load_dotenv(_ENV_DIR / ".env", override=True)
 load_dotenv(_ENV_DIR / ".env.local", override=True)
+from pipecat.services.gradium.stt import GradiumSTTService
+from pipecat.transcriptions.language import Language
+
+from interfaces import TOOL_REGISTRY, CallState, build_system_instruction, default_call_state
+from nemotron_llm import VLLMOpenAILLMService
 
 # ── P2 / P3 modules append to TOOL_REGISTRY at import time ────────────────────
 # Add an import line here once each teammate's module is ready:
@@ -672,9 +677,11 @@ async def run_bot(
     system_instruction = build_system_instruction(call_state)
 
     # ── Services ──────────────────────────────────────────────────────────────
-    stt = NVidiaWebSocketSTTService(
-        url=os.getenv("NVIDIA_ASR_URL", "ws://192.168.7.228:8081"),
-        strip_interim_prefix=True,
+    stt = GradiumSTTService(
+        api_key=os.environ["GRADIUM_API_KEY"],
+        settings=GradiumSTTService.Settings(
+            language=Language.EN,
+        ),
     )
 
     llm = VLLMOpenAILLMService(

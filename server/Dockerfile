@@ -20,4 +20,3 @@ RUN --mount=type=cache,target=/root/.cache/uv \
 COPY ./bot-nemotron.py bot.py
 COPY ./interfaces.py interfaces.py
 COPY ./nemotron_llm.py nemotron_llm.py
-COPY ./nvidia_stt.py nvidia_stt.py

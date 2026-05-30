@@ -1,4 +1,4 @@
-agent_name = "voicemail-proxy"
+agent_name = "voicemail"
 secret_set = "voicemail-proxy-secrets"
 agent_profile = "agent-1x"
 
