@@ -18,8 +18,11 @@ Run locally::
     ENV=local uv run bot-nemotron.py
 """
 
+import asyncio
+import json
 import os
 from pathlib import Path
+import time
 
 import aiohttp
 from dotenv import load_dotenv
@@ -120,6 +123,172 @@ async def _send_owner_sms(call_state: CallState, body: str) -> None:
         logger.error(f"SMS error: {exc}")
 
 
+# ─── Voice ID resolution — owner clone with consent guard ────────────────────
+
+
+def _resolve_voice_id() -> str:
+    """Return the voice ID to use for TTS.
+
+    Priority:
+      1. Owner's cloned voice — requires BOTH:
+           GRADIUM_CLONED_VOICE_ID  set to the ID obtained from Gradium's
+                                    voice-cloning page (gradium.ai → Voices)
+           OWNER_VOICE_CONSENT=true  explicit opt-in flag; protects against
+                                     accidental or unauthorised cloning use
+      2. Default Gradium voice — GRADIUM_VOICE_ID (falls back to the
+         hardcoded default if that env var is also unset)
+
+    The function logs exactly which path was taken so it's always auditable.
+    NEVER set GRADIUM_CLONED_VOICE_ID to a caller's voice — only the owner
+    records the sample and provides consent.
+    """
+    cloned_id = os.getenv("GRADIUM_CLONED_VOICE_ID", "").strip()
+    consent = os.getenv("OWNER_VOICE_CONSENT", "false").strip().lower() == "true"
+
+    if cloned_id and consent:
+        logger.info("TTS: using owner's cloned voice (id=%s)", cloned_id)
+        return cloned_id
+
+    if cloned_id and not consent:
+        logger.warning(
+            "TTS: GRADIUM_CLONED_VOICE_ID is set but OWNER_VOICE_CONSENT != true — "
+            "falling back to default voice. Set OWNER_VOICE_CONSENT=true to enable."
+        )
+
+    default_id = os.getenv("GRADIUM_VOICE_ID", "Eu9iL_CYe8N-Gkx_")
+    logger.info("TTS: using default Gradium voice (id=%s)", default_id)
+    return default_id
+
+
+# ─── Triage oracle — thinking-enabled urgency assessment ─────────────────────
+
+
+async def _triage_with_thinking(
+    reason: str,
+    caller_name: str,
+    stated_urgency: str,
+    persona_context: str,
+) -> dict:
+    """Call Nemotron with thinking ON to independently assess urgency.
+
+    Launched as a background asyncio task from capture_message_reason and
+    awaited (with timeout) inside capture_urgency, so the inference latency
+    is hidden behind the LLM's question turn + caller's response time.
+
+    Returns a dict:
+        urgency          — "urgent" | "normal" | "low"
+        confidence       — 0.0–1.0
+        one_line_reason  — brief justification string
+        reasoning_trace  — full <think> block for the judge trace
+    """
+    base_url = os.getenv("NEMOTRON_LLM_URL", "http://192.168.7.228:8000/v1").rstrip("/")
+    model = os.getenv("NEMOTRON_LLM_MODEL", "nvidia/nemotron-3-super")
+    api_key = os.getenv("NEMOTRON_LLM_API_KEY", "EMPTY")
+
+    system_msg = (
+        "You are a message-triage assistant. Assess the TRUE urgency of this voicemail "
+        "based on its content — not just what the caller claims.\n\n"
+        "Urgency levels:\n"
+        "- urgent: Same-day or immediate attention. Time-sensitive decision, safety concern, "
+        "VIP or priority contact, or a missed opportunity if delayed.\n"
+        "- normal: Standard matter. Can be handled within 1–2 business days.\n"
+        "- low: No time pressure. Informational or low-stakes.\n"
+        + (f"\nOwner context:\n{persona_context}\n" if persona_context else "")
+        + "\nRespond with EXACTLY this JSON object and no other text:\n"
+        '{"urgency": "urgent"|"normal"|"low", "confidence": 0.0-1.0, "one_line_reason": "..."}'
+    )
+    user_msg = (
+        f"Caller name: {caller_name or 'Unknown'}.\n"
+        f"Message: {reason}.\n"
+        + (f"Caller's stated urgency: {stated_urgency}." if stated_urgency else "")
+    )
+
+    payload = {
+        "model": model,
+        "messages": [
+            {"role": "system", "content": system_msg},
+            {"role": "user", "content": user_msg},
+        ],
+        "temperature": 0.1,
+        "max_tokens": 512,
+        "stream": False,
+        "extra_body": {"chat_template_kwargs": {"enable_thinking": True}},
+    }
+    headers = {"Authorization": f"Bearer {api_key}", "Content-Type": "application/json"}
+    url = f"{base_url}/chat/completions"
+    fallback = {
+        "urgency": stated_urgency or "normal",
+        "confidence": 0.0,
+        "one_line_reason": "triage_unavailable",
+        "reasoning_trace": "",
+    }
+
+    t0 = time.monotonic()
+    try:
+        async with aiohttp.ClientSession(timeout=aiohttp.ClientTimeout(total=15)) as session:
+            async with session.post(url, json=payload, headers=headers) as resp:
+                if resp.status != 200:
+                    logger.warning("Triage HTTP %s: %s", resp.status, (await resp.text())[:200])
+                    return fallback
+                data = await resp.json()
+
+        elapsed = time.monotonic() - t0
+        choice_msg = data["choices"][0]["message"]
+
+        # Extract reasoning trace.
+        # Path A — vLLM reasoning parser active: separate "reasoning_content" field.
+        # Path B — no parser: trace is inline wrapped in <think>…</think> tags.
+        reasoning_trace: str = choice_msg.get("reasoning_content") or ""
+        content: str = choice_msg.get("content") or ""
+
+        if not reasoning_trace and "<think>" in content and "</think>" in content:
+            t_start = content.index("<think>") + len("<think>")
+            t_end = content.index("</think>")
+            reasoning_trace = content[t_start:t_end].strip()
+            content = content[t_end + len("</think>"):].strip()
+
+        # Parse the JSON decision; fall back to keyword scan if malformed.
+        try:
+            decision = json.loads(content.strip())
+        except (json.JSONDecodeError, ValueError):
+            lower = content.lower()
+            decision = {
+                "urgency": "urgent" if "urgent" in lower else ("low" if "low" in lower else "normal"),
+                "confidence": 0.4,
+                "one_line_reason": content[:100].strip(),
+            }
+
+        model_urgency = decision.get("urgency", "normal")
+        confidence = float(decision.get("confidence", 0.5))
+        one_line = decision.get("one_line_reason", "")
+
+        logger.info(
+            "TRIAGE | caller=%r reason=%r stated=%r → model=%r conf=%.2f latency=%.1fs | %s",
+            caller_name, reason[:80], stated_urgency, model_urgency, confidence, elapsed, one_line,
+        )
+        if reasoning_trace:
+            # Clearly delimited so judges can copy the full trace from logs.
+            logger.info(
+                "TRIAGE REASONING TRACE ── begin ──────────────────────────────\n"
+                "%s\n"
+                "TRIAGE REASONING TRACE ── end ────────────────────────────────",
+                reasoning_trace,
+            )
+
+        return {
+            "urgency": model_urgency,
+            "confidence": confidence,
+            "one_line_reason": one_line,
+            "reasoning_trace": reasoning_trace,
+        }
+
+    except asyncio.CancelledError:
+        raise  # let asyncio manage task cancellation normally
+    except Exception as exc:
+        logger.warning("Triage oracle failed: %s", exc)
+        return {**fallback, "one_line_reason": f"error: {exc}"}
+
+
 # ─── end_call — module-level (no call_state needed) ──────────────────────────
 
 
@@ -155,6 +324,14 @@ async def run_bot(
     # One CallState per call — closed over by all P1 tool closures below.
     call_state = default_call_state(caller_number=from_number or "")
 
+    # Thinking mode: controls the triage oracle only. Pipeline LLM is always off.
+    enable_thinking = os.getenv("NEMOTRON_ENABLE_THINKING", "false").lower() == "true"
+    if enable_thinking:
+        logger.info("Thinking mode enabled — triage oracle will use Nemotron reasoning")
+
+    # Mutable container for the background triage task; avoids nonlocal boilerplate.
+    _triage: dict = {"task": None}
+
     # ── P1 voicemail tools (closures — close over call_state directly) ────────
 
     async def capture_caller_identity(params: FunctionCallParams, name: str) -> None:
@@ -175,21 +352,90 @@ async def run_bot(
             reason: A concise description of the caller's topic or request.
         """
         call_state["voicemail"]["message"]["reason"] = reason
-        logger.debug(f"capture_message_reason: {reason!r}")
+        logger.debug("capture_message_reason: %r", reason)
+
+        if enable_thinking:
+            # Launch the triage oracle in the background. By the time the LLM
+            # asks "how urgent is this?" and the caller replies, the reasoning
+            # call will likely be done and capture_urgency can just await it.
+            _triage["task"] = asyncio.create_task(
+                _triage_with_thinking(
+                    reason=reason,
+                    caller_name=call_state["voicemail"]["message"].get("caller_name", ""),
+                    stated_urgency="",
+                    persona_context=call_state["persona_context"],
+                )
+            )
+            logger.debug("Triage oracle launched in background")
+
         await params.result_callback({"ok": True, "reason": reason})
 
     async def capture_urgency(params: FunctionCallParams, urgency: str) -> None:
-        """Store the caller's urgency level.
+        """Store the caller's urgency level, cross-checked against the reasoning
+        triage oracle when NEMOTRON_ENABLE_THINKING is set. The model never
+        downgrades what the caller stated — it can only escalate.
 
         Args:
             urgency: One of "urgent", "normal", or "low".
         """
-        level = urgency.lower().strip()
-        if level not in ("urgent", "normal", "low"):
-            level = "normal"
-        call_state["voicemail"]["message"]["urgency"] = level
-        logger.debug(f"capture_urgency: {level!r}")
-        await params.result_callback({"ok": True, "urgency": level})
+        _LEVELS = {"urgent": 2, "normal": 1, "low": 0}
+
+        stated = urgency.lower().strip()
+        if stated not in _LEVELS:
+            stated = "normal"
+
+        final_urgency = stated
+        triage_meta: dict = {}
+
+        if _triage["task"] is not None:
+            try:
+                # asyncio.shield keeps the task alive if wait_for times out,
+                # so the trace still gets logged even when we fall back.
+                triage = await asyncio.wait_for(
+                    asyncio.shield(_triage["task"]), timeout=8.0
+                )
+                _triage["task"] = None
+                triage_meta = triage
+                model_urgency = triage["urgency"]
+
+                if _LEVELS.get(model_urgency, 1) > _LEVELS.get(stated, 1):
+                    final_urgency = model_urgency
+                    logger.info(
+                        "Urgency escalated by triage: caller said %r → model assessed %r "
+                        "(conf=%.2f, reason: %s)",
+                        stated, model_urgency,
+                        triage.get("confidence", 0.0),
+                        triage.get("one_line_reason", ""),
+                    )
+                else:
+                    logger.info(
+                        "Urgency confirmed: caller=%r model=%r (conf=%.2f) → using %r",
+                        stated, model_urgency,
+                        triage.get("confidence", 0.0),
+                        final_urgency,
+                    )
+            except asyncio.TimeoutError:
+                logger.warning(
+                    "Triage oracle timed out — using caller's stated urgency: %r", stated
+                )
+                triage_meta = {
+                    "urgency": stated, "confidence": 0.0,
+                    "one_line_reason": "timeout", "reasoning_trace": "",
+                }
+
+        call_state["voicemail"]["message"]["urgency"] = final_urgency
+        call_state["voicemail"]["message"]["triage"] = triage_meta
+
+        logger.debug("capture_urgency: stated=%r final=%r", stated, final_urgency)
+        await params.result_callback({
+            "ok": True,
+            "urgency": final_urgency,
+            "stated_urgency": stated,
+            **({"triage": {
+                "model_urgency": triage_meta.get("urgency", ""),
+                "confidence": triage_meta.get("confidence", 0.0),
+            }} if triage_meta else {}),
+        })
 
     async def capture_callback_preference(
         params: FunctionCallParams,
@@ -295,11 +541,20 @@ async def run_bot(
         action += f" re: {reason}"
         call_state["voicemail"]["action_items"] = [action]
 
+        triage_meta = msg.get("triage", {})
         logger.info(
-            "finish_voicemail | summary=%r | message=%s | sms_sent=%s",
+            "finish_voicemail | summary=%r | urgency=%s | triage_model=%s "
+            "triage_conf=%.2f | sms_sent=%s",
             summary,
-            msg,
+            urgency,
+            triage_meta.get("urgency", "n/a"),
+            triage_meta.get("confidence", 0.0),
             call_state["voicemail"]["sms_sent"],
+        )
+        # Full message payload (excluding trace to avoid log spam on repeat reads)
+        logger.debug(
+            "finish_voicemail message payload: %s",
+            {k: v for k, v in msg.items() if k not in ("triage",)},
         )
 
         # Auto-SMS the owner on urgent messages
@@ -364,21 +619,23 @@ async def run_bot(
         strip_interim_prefix=True,
     )
 
-    enable_thinking = os.getenv("NEMOTRON_ENABLE_THINKING", "false").lower() == "true"
     llm = VLLMOpenAILLMService(
         api_key=os.getenv("NEMOTRON_LLM_API_KEY", "EMPTY"),
         base_url=os.getenv("NEMOTRON_LLM_URL", "http://192.168.7.228:8000/v1"),
         settings=VLLMOpenAILLMService.Settings(
             model=os.getenv("NEMOTRON_LLM_MODEL", "nvidia/nemotron-3-super"),
             system_instruction=system_instruction,
-            extra={"extra_body": {"chat_template_kwargs": {"enable_thinking": enable_thinking}}},
+            # Pipeline LLM: thinking always OFF. Reasoning tokens can bleed into
+            # TTS if the vLLM server has no --reasoning-parser configured.
+            # Thinking is used only by the background triage oracle.
+            extra={"extra_body": {"chat_template_kwargs": {"enable_thinking": False}}},
         ),
     )
 
     tts = GradiumTTSService(
         api_key=os.environ["GRADIUM_API_KEY"],
         settings=GradiumTTSService.Settings(
-            voice=os.getenv("GRADIUM_VOICE_ID", "Eu9iL_CYe8N-Gkx_"),
+            voice=_resolve_voice_id(),
         ),
     )
 
