@@ -505,6 +505,63 @@ async def run_bot(
             }
         )
 
+    async def notify_owner_sms(params: FunctionCallParams, note: str = "") -> None:
+        """Text the owner a one-line callback summary RIGHT NOW via Twilio SMS.
+
+        Call this when the caller explicitly asks to notify the owner immediately
+        (e.g. "can you let them know straight away?") or when you judge the
+        situation warrants it regardless of whether the full message is complete.
+
+        Safety rules (enforced in code — not just the prompt):
+        - SMS goes ONLY to the owner's registered OWNER_PHONE_NUMBER.
+        - The caller's number is never used as a destination.
+        - Duplicate sends within the same call are silently skipped.
+
+        Args:
+            note: Optional extra context to append, max ~30 words.
+                  Examples: "caller is waiting on-site",
+                             "caller sounded very distressed".
+                  Omit for a plain auto-built summary.
+        """
+        # Idempotency: never double-send within the same call.
+        if call_state["voicemail"]["sms_sent"]:
+            logger.info("notify_owner_sms: SMS already sent this call — skipping")
+            await params.result_callback({
+                "ok": True,
+                "skipped": True,
+                "reason": "SMS already sent for this call",
+            })
+            return
+
+        msg = call_state["voicemail"]["message"]
+        name = msg.get("caller_name") or "Unknown caller"
+        reason = msg.get("reason") or "(reason not yet captured)"
+        urgency = (msg.get("urgency") or "normal").upper()
+        cb_num = msg.get("callback_number") or ""
+        caller_number = call_state["voicemail"]["caller_number"]
+
+        # Build the one-line summary: [URGENCY] Name (number) re: reason — cb: num | note
+        parts = [f"[{urgency}]", name]
+        if caller_number:
+            parts.append(f"({caller_number})")
+        parts.append(f"re: {reason}")
+        if cb_num:
+            parts.append(f"— cb: {cb_num}")
+        if note:
+            parts.append(f"| {note.strip()}")
+        body = " ".join(parts)[:160]  # hard cap at Twilio's single-SMS limit
+
+        await _send_owner_sms(call_state, body)
+
+        if call_state["voicemail"]["sms_sent"]:
+            logger.info("notify_owner_sms: sent %r", body)
+            await params.result_callback({"ok": True, "body": body})
+        else:
+            await params.result_callback({
+                "ok": False,
+                "reason": "SMS send failed — check TWILIO_* and OWNER_PHONE_NUMBER in .env",
+            })
+
     async def finish_voicemail(params: FunctionCallParams) -> None:
         """Persist the voicemail, log the structured summary, and send an SMS
         to the owner if the message is urgent. Call this at step 6, immediately
@@ -579,6 +636,7 @@ async def run_bot(
         capture_message_reason,
         capture_urgency,
         capture_callback_preference,
+        notify_owner_sms,
         get_voicemail_summary,
         finish_voicemail,
         end_call,
