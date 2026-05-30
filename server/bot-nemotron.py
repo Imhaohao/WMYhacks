@@ -86,66 +86,11 @@ async def get_call_info(call_sid: str) -> dict:
         return {}
 
 
-# ─── P1 core voicemail tools ──────────────────────────────────────────────────
-# These are the baseline tools P1 owns. P2 and P3 append theirs to TOOL_REGISTRY
-# from their own modules (see import block above).
+# ─── P1 internal helper (not a tool) ─────────────────────────────────────────
 
 
-async def record_message(
-    params: FunctionCallParams,
-    call_state: CallState,
-    caller_name: str,
-    callback_number: str,
-    subject: str,
-    urgency: str = "normal",
-) -> None:
-    """Record the caller's complete message into call_state.
-
-    Call this once you have collected the caller's name, callback number,
-    subject, and urgency level. Do NOT call it until all four are confirmed.
-
-    Args:
-        caller_name: The caller's name as they stated it.
-        callback_number: The phone number the caller wants the owner to call back.
-        subject: One-sentence summary of why they called.
-        urgency: "urgent" | "normal" | "low". Default "normal".
-    """
-    call_state["voicemail"]["action_items"].append(
-        f"[{urgency.upper()}] Call back {caller_name} at {callback_number} re: {subject}"
-    )
-    logger.info(
-        f"Message recorded — caller={caller_name} cb={callback_number} "
-        f"urgency={urgency} subject={subject}"
-    )
-    await params.result_callback(
-        {
-            "ok": True,
-            "recorded": {
-                "caller_name": caller_name,
-                "callback_number": callback_number,
-                "subject": subject,
-                "urgency": urgency,
-            },
-        }
-    )
-
-
-async def notify_owner_sms(
-    params: FunctionCallParams,
-    call_state: CallState,
-    message_body: str,
-) -> None:
-    """Send a Twilio SMS to the owner summarising the voicemail.
-
-    Call this after record_message has confirmed the message. Use only when
-    urgency is "urgent" or when the caller explicitly asks for immediate
-    notification. For normal messages, the owner checks their inbox.
-
-    Args:
-        message_body: The SMS text to send. Keep it under 160 chars.
-            Example: "New voicemail from Alex (+14155551234): urgent — needs
-            callback re: contract renewal."
-    """
+async def _send_owner_sms(call_state: CallState, body: str) -> None:
+    """Fire-and-forget Twilio SMS to the owner. Called by finish_voicemail."""
     account_sid = os.getenv("TWILIO_ACCOUNT_SID")
     auth_token = os.getenv("TWILIO_AUTH_TOKEN")
     owner_number = os.getenv("OWNER_PHONE_NUMBER")
@@ -153,8 +98,6 @@ async def notify_owner_sms(
 
     if not all([account_sid, auth_token, owner_number, twilio_number]):
         logger.warning("Twilio SMS not configured — skipping owner notification")
-        call_state["voicemail"]["sms_sent"] = False
-        await params.result_callback({"ok": False, "reason": "SMS not configured"})
         return
 
     url = f"https://api.twilio.com/2010-04-01/Accounts/{account_sid}/Messages.json"
@@ -163,18 +106,18 @@ async def notify_owner_sms(
             async with session.post(
                 url,
                 auth=aiohttp.BasicAuth(account_sid, auth_token),  # type: ignore[arg-type]
-                data={"From": twilio_number, "To": owner_number, "Body": message_body},
+                data={"From": twilio_number, "To": owner_number, "Body": body},
             ) as resp:
                 if resp.status not in (200, 201):
                     logger.error(f"SMS send failed ({resp.status}): {await resp.text()}")
-                    await params.result_callback({"ok": False, "reason": "Twilio error"})
                     return
                 call_state["voicemail"]["sms_sent"] = True
-                logger.info(f"Owner SMS sent: {message_body}")
-                await params.result_callback({"ok": True})
+                logger.info(f"Owner SMS sent: {body}")
     except Exception as exc:
         logger.error(f"SMS error: {exc}")
-        await params.result_callback({"ok": False, "reason": str(exc)})
+
+
+# ─── end_call — module-level (no call_state needed) ──────────────────────────
 
 
 async def end_call(params: FunctionCallParams) -> None:
@@ -185,11 +128,6 @@ async def end_call(params: FunctionCallParams) -> None:
     await params.result_callback(
         {"ok": True}, properties=FunctionCallResultProperties(run_llm=False)
     )
-
-
-# Seed TOOL_REGISTRY with P1's tools.
-# P2 / P3 append theirs at module import time (see imports above).
-TOOL_REGISTRY.extend([record_message, notify_owner_sms, end_call])
 
 
 # ─── Main bot ─────────────────────────────────────────────────────────────────
@@ -211,44 +149,206 @@ async def run_bot(
     """
     logger.info("Starting voicemail bot")
 
-    # One CallState per call — closed over by all tool closures below.
+    # One CallState per call — closed over by all P1 tool closures below.
     call_state = default_call_state(caller_number=from_number or "")
 
-    # ── Bind call_state into tools that need it ───────────────────────────────
-    # TOOL_REGISTRY entries that accept a `call_state` parameter get a closure
-    # wrapping them so the LLM sees the simpler (no call_state) signature while
-    # the implementation still mutates the per-call dict.
-    #
-    # Convention: if a tool's first non-params arg is named `call_state` and
-    # typed CallState, wrap it here. P2/P3 should follow the same pattern in
-    # their modules.
+    # ── P1 voicemail tools (closures — close over call_state directly) ────────
+
+    async def capture_caller_identity(params: FunctionCallParams, name: str) -> None:
+        """Store the caller's name. Call this as soon as they give their name.
+
+        Args:
+            name: The caller's name as they stated it.
+        """
+        call_state["voicemail"]["message"]["caller_name"] = name
+        logger.debug(f"capture_caller_identity: {name!r}")
+        await params.result_callback({"ok": True, "caller_name": name})
+
+    async def capture_message_reason(params: FunctionCallParams, reason: str) -> None:
+        """Store the reason the caller is leaving a message. Call this once
+        they've explained what they're calling about, even briefly.
+
+        Args:
+            reason: A concise description of the caller's topic or request.
+        """
+        call_state["voicemail"]["message"]["reason"] = reason
+        logger.debug(f"capture_message_reason: {reason!r}")
+        await params.result_callback({"ok": True, "reason": reason})
+
+    async def capture_urgency(params: FunctionCallParams, urgency: str) -> None:
+        """Store the caller's urgency level.
+
+        Args:
+            urgency: One of "urgent", "normal", or "low".
+        """
+        level = urgency.lower().strip()
+        if level not in ("urgent", "normal", "low"):
+            level = "normal"
+        call_state["voicemail"]["message"]["urgency"] = level
+        logger.debug(f"capture_urgency: {level!r}")
+        await params.result_callback({"ok": True, "urgency": level})
+
+    async def capture_callback_preference(
+        params: FunctionCallParams,
+        wants_callback: bool,
+        callback_number: str = "",
+        callback_preferred_time: str = "",
+    ) -> None:
+        """Store the caller's callback preference.
+
+        Args:
+            wants_callback: True if the caller wants the owner to call them back.
+            callback_number: Phone number to call back. Omit if wants_callback is False.
+            callback_preferred_time: When the caller prefers to be called
+                (e.g. "after 3 pm", "tomorrow morning"). Omit if not specified.
+        """
+        msg = call_state["voicemail"]["message"]
+        msg["wants_callback"] = wants_callback
+        msg["callback_number"] = callback_number
+        msg["callback_preferred_time"] = callback_preferred_time
+        logger.debug(
+            f"capture_callback_preference: wants={wants_callback} "
+            f"num={callback_number!r} time={callback_preferred_time!r}"
+        )
+        await params.result_callback(
+            {
+                "ok": True,
+                "wants_callback": wants_callback,
+                "callback_number": callback_number,
+                "callback_preferred_time": callback_preferred_time,
+            }
+        )
+
+    async def get_voicemail_summary(params: FunctionCallParams) -> None:
+        """Return the message collected so far so you can read it back to the
+        caller for confirmation. Call this at step 5 — before finish_voicemail."""
+        msg = call_state["voicemail"]["message"]
+        name = msg.get("caller_name", "(not captured)")
+        reason = msg.get("reason", "(not captured)")
+        urgency = msg.get("urgency", "normal")
+        wants_cb = msg.get("wants_callback", False)
+        cb_num = msg.get("callback_number", "")
+        cb_time = msg.get("callback_preferred_time", "")
+
+        summary_parts = [
+            f"Caller: {name}",
+            f"Reason: {reason}",
+            f"Urgency: {urgency}",
+        ]
+        if wants_cb:
+            cb_line = f"Callback requested at {cb_num}"
+            if cb_time:
+                cb_line += f", preferred time: {cb_time}"
+            summary_parts.append(cb_line)
+        else:
+            summary_parts.append("No callback requested")
+
+        summary_text = ". ".join(summary_parts) + "."
+        logger.debug(f"get_voicemail_summary: {summary_text}")
+        await params.result_callback(
+            {
+                "summary": summary_text,
+                "message": dict(msg),
+                "instruction": (
+                    "Read this summary back to the caller word for word, "
+                    "then ask: 'Does that sound right?'"
+                ),
+            }
+        )
+
+    async def finish_voicemail(params: FunctionCallParams) -> None:
+        """Persist the voicemail, log the structured summary, and send an SMS
+        to the owner if the message is urgent. Call this at step 6, immediately
+        before saying goodbye and calling end_call."""
+        msg = call_state["voicemail"]["message"]
+        name = msg.get("caller_name", "Unknown")
+        reason = msg.get("reason", "")
+        urgency = msg.get("urgency", "normal")
+        wants_cb = msg.get("wants_callback", False)
+        cb_num = msg.get("callback_number", "")
+        cb_time = msg.get("callback_preferred_time", "")
+        caller_number = call_state["voicemail"]["caller_number"]
+
+        # Build human-readable summary
+        cb_clause = ""
+        if wants_cb and cb_num:
+            cb_clause = f" Callback: {cb_num}"
+            if cb_time:
+                cb_clause += f" ({cb_time})"
+            cb_clause += "."
+
+        summary = (
+            f"[{urgency.upper()}] Voicemail from {name}"
+            + (f" ({caller_number})" if caller_number else "")
+            + f": {reason}.{cb_clause}"
+        )
+        call_state["voicemail"]["summary"] = summary
+
+        action = f"[{urgency.upper()}] Reply to {name}"
+        if cb_num:
+            action += f" at {cb_num}"
+        if cb_time:
+            action += f" ({cb_time} preferred)"
+        action += f" re: {reason}"
+        call_state["voicemail"]["action_items"] = [action]
+
+        logger.info(
+            "finish_voicemail | summary=%r | message=%s | sms_sent=%s",
+            summary,
+            msg,
+            call_state["voicemail"]["sms_sent"],
+        )
+
+        # Auto-SMS the owner on urgent messages
+        if urgency == "urgent":
+            sms_body = f"Urgent voicemail: {summary}"[:160]
+            await _send_owner_sms(call_state, sms_body)
+
+        await params.result_callback(
+            {
+                "ok": True,
+                "summary": summary,
+                "instruction": (
+                    "Say a short goodbye now and call end_call in this same turn. "
+                    "Example: 'Great, I'll make sure they get your message. Take care!'"
+                ),
+            }
+        )
+
+    # P1's tool list — closures above + module-level end_call
+    p1_tools = [
+        capture_caller_identity,
+        capture_message_reason,
+        capture_urgency,
+        capture_callback_preference,
+        get_voicemail_summary,
+        finish_voicemail,
+        end_call,
+    ]
+
+    # ── Bind call_state into P2/P3 TOOL_REGISTRY entries ─────────────────────
+    # Convention: if a registry tool's second param is named `call_state`, it
+    # gets wrapped so Pipecat sees `(params, ...)` with no call_state arg.
 
     import functools
     import inspect
 
     def bind_call_state(fn):
-        """Wrap a tool whose second param is `call_state` so Pipecat sees the
-        correct signature: first param named `params`, no `call_state` param."""
         sig = inspect.signature(fn)
         param_names = list(sig.parameters.keys())
         if len(param_names) > 1 and param_names[1] == "call_state":
             @functools.wraps(fn)
             async def bound(params, **kwargs):
                 return await fn(params, call_state=call_state, **kwargs)
-            # Drop `call_state` from the visible signature so Pipecat's schema
-            # generator doesn't try to inject it as an LLM argument.
             new_params = [p for k, p in sig.parameters.items() if k != "call_state"]
             bound.__signature__ = sig.replace(parameters=new_params)
             return bound
         return fn
 
-    bound_tools = [bind_call_state(fn) for fn in TOOL_REGISTRY]
+    all_tools = p1_tools + [bind_call_state(fn) for fn in TOOL_REGISTRY]
 
     # ── P2: inject persona_context before building system instruction ──────────
-    # TODO (P2): populate call_state["persona_context"] here by calling your
-    #   calendar / iMessage analysis functions, e.g.:
-    #       call_state["persona_context"] = await fetch_owner_context(from_number)
-    # The build_system_instruction() call below will embed it automatically.
+    # TODO (P2): set call_state["persona_context"] = await fetch_owner_context(from_number)
 
     system_instruction = build_system_instruction(call_state)
 
@@ -276,8 +376,8 @@ async def run_bot(
         ),
     )
 
-    tools = ToolsSchema(standard_tools=bound_tools)
-    for fn in bound_tools:
+    tools = ToolsSchema(standard_tools=all_tools)
+    for fn in all_tools:
         llm.register_direct_function(fn)
 
     context = LLMContext(tools=tools)
@@ -317,9 +417,7 @@ async def run_bot(
         context.add_message(
             {
                 "role": "user",
-                "content": (
-                    "A caller just connected. Greet them warmly and ask how you can help."
-                ),
+                "content": "A caller just connected. Begin step 1: greet them and ask for their name.",
             }
         )
         await worker.queue_frames([LLMRunFrame()])

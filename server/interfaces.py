@@ -25,12 +25,16 @@ class VoicemailState(TypedDict):
     """Owned by P1. Populated throughout the call and persisted at end."""
 
     transcript: str          # running verbatim transcript (P1 appends each turn)
-    summary: str             # structured summary — filled by LLM at call end
+    summary: str             # human-readable summary — written by finish_voicemail
     caller_number: str       # E.164 (Twilio) or "" (WebRTC / unknown)
     duration_seconds: int    # updated live by P1 every 30 s
     recorded_at: str         # ISO-8601 UTC timestamp when call started
-    action_items: list[str]  # extracted during conversation
-    callback_slot: str | None  # ISO datetime if caller booked a callback (P2 sets)
+    # Structured message fields — written incrementally by capture_* tools (P1)
+    message: dict            # keys: caller_name, reason, urgency,
+                             #       wants_callback, callback_number,
+                             #       callback_preferred_time
+    action_items: list[str]  # one-line action strings, written by finish_voicemail
+    callback_slot: str | None  # ISO datetime if P2 books a calendar slot
     sms_sent: bool           # True once Twilio SMS dispatched to owner
     email_sent: bool         # True once Gmail email dispatched to owner
 
@@ -79,6 +83,7 @@ def default_call_state(caller_number: str = "") -> CallState:
             caller_number=caller_number,
             duration_seconds=0,
             recorded_at=datetime.datetime.now(datetime.timezone.utc).isoformat(),
+            message={},
             action_items=[],
             callback_slot=None,
             sms_sent=False,
@@ -114,9 +119,12 @@ def default_call_state(caller_number: str = "") -> CallState:
 #   - Each entry must be an async callable matching Pipecat's FunctionCallParams
 #     signature.
 #   - Tool names must be unique across all modules — coordinate to avoid clashes.
-#   - P1 seeds the list with core voicemail tools (below, after their definition).
+#   - P1's core tools (capture_*, finish_voicemail, end_call) are closures defined
+#     inside run_bot — they close over call_state directly and are NOT in this list.
 #   - P2 appends: book_callback_slot, get_calendar_availability, …
 #   - P3 appends: update_caller_snapshot, lookup_persona, …
+#   - If your tool needs call_state, declare it as the second parameter named
+#     `call_state: CallState` — bot-nemotron.py's bind_call_state() will wrap it.
 
 TOOL_REGISTRY: list = []  # bot-nemotron.py reads this at pipeline startup
 
@@ -185,27 +193,45 @@ def build_system_instruction(
         "## This Call\n"
         f"{caller_line}\n"
         f"Today is {today.strftime('%A, %B %d, %Y')}.\n\n"
-        "## Your Job\n"
-        "1. Greet the caller warmly and introduce yourself as the owner's assistant.\n"
-        "2. Ask for their name and the reason for their call.\n"
-        "3. Collect a complete message: name, callback number, urgency, subject.\n"
-        "4. If their topic matches a priority in Owner Context, acknowledge that "
-        "the owner will be notified promptly.\n"
-        "5. Offer to book a callback slot only if the caller explicitly asks AND "
-        "the calendar shows availability (use get_calendar_availability).\n"
-        "6. When the message is complete, confirm it back to the caller once, then "
-        "say a short goodbye and call end_call in the same turn.\n\n"
+        # ── WORKFLOW — P1 defines the step sequence ───────────────────────────
+        "## Workflow — follow this order exactly\n"
+        "Ask ONE question per turn. Call the tool as soon as you have a confirmed "
+        "answer. Never ask two things in the same sentence.\n\n"
+        "Step 1 — Greet and get their name.\n"
+        "   Say: 'Hi, you've reached [owner]'s voicemail assistant. May I ask who's calling?'\n"
+        "   → call capture_caller_identity once they give their name.\n\n"
+        "Step 2 — Reason for calling.\n"
+        "   Ask: 'And what would you like to leave a message about?'\n"
+        "   → call capture_message_reason once they explain.\n\n"
+        "Step 3 — Urgency.\n"
+        "   Ask: 'How urgent is this — urgent, normal, or can it wait?'\n"
+        "   → call capture_urgency with 'urgent', 'normal', or 'low'.\n"
+        "   If their topic matches a priority in Owner Context, say so: "
+        "'I'll make sure this gets flagged as urgent.'\n\n"
+        "Step 4 — Callback preference.\n"
+        "   Ask: 'Would you like a callback? If so, what number and what time works?'\n"
+        "   → call capture_callback_preference.\n"
+        "   If they don't want a callback, pass wants_callback=False and omit the other args.\n\n"
+        "Step 5 — Confirm the message.\n"
+        "   Call get_voicemail_summary. Read the result back to the caller word for word.\n"
+        "   Ask: 'Does that sound right?'\n"
+        "   If they correct anything, call the relevant capture_* tool again, "
+        "then call get_voicemail_summary again before continuing.\n\n"
+        "Step 6 — Finish and hang up.\n"
+        "   Call finish_voicemail to save the message.\n"
+        "   In the same turn say a short goodbye "
+        "(e.g. 'Great, I'll pass that along. Talk soon!')\n"
+        "   then call end_call.\n\n"
+        # ─────────────────────────────────────────────────────────────────────
         "## Phone Etiquette\n"
-        "- 1–2 short sentences per turn. Longer only for the final message read-back.\n"
-        "- Ask ONE thing at a time — name first, then callback number, then subject.\n"
+        "- 1–2 short sentences per turn. Longer only at step 5 (reading back the summary).\n"
         "- No filler openers ('Absolutely!', 'Perfect!', 'Great!'). Go straight to the point.\n"
         "- No bullet points, no emojis. Responses are spoken aloud.\n"
-        "- Do NOT reveal the owner's location, schedule details, or personal information.\n\n"
+        "- Use contractions. Fragments are fine.\n"
+        "- Do NOT reveal the owner's location, exact schedule, or personal details.\n\n"
         # ── P3 NOTE (caller_snapshot) ─────────────────────────────────────────
         "## Tone Adaptation\n"
-        "Adapt your tone to the caller's affect. P3's update_caller_snapshot tool "
-        "updates call_state['caller_snapshot'] live — use those signals to stay "
-        "efficient with rushed callers, warm with distressed ones, and calm with "
-        "hostile ones. The snapshot is also stored at call end.\n"
+        "Adapt your tone to the caller's affect — efficient with rushed callers, "
+        "warm with distressed ones, calm with hostile ones.\n"
         # ─────────────────────────────────────────────────────────────────────
     )
