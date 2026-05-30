@@ -23,6 +23,18 @@ import os
 import urllib.error
 import urllib.request
 from dataclasses import dataclass
+from pathlib import Path
+
+from dotenv import load_dotenv
+
+# Load server/.env (and .env.local override) so the harness sees OPENAI_API_KEY,
+# OLLAMA_*, etc. when run standalone as `python -m eval.*` -- the bots load these
+# via load_dotenv() but the eval entrypoints otherwise would not, so `auto` would
+# never reach OpenAI even with a valid key in .env. Must run before the os.getenv
+# config reads below.
+_ENV_DIR = Path(__file__).resolve().parent.parent
+load_dotenv(_ENV_DIR / ".env")
+load_dotenv(_ENV_DIR / ".env.local", override=True)
 
 # --- configuration -------------------------------------------------------
 

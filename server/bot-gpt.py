@@ -20,7 +20,7 @@ Run the bot using::
 
 import os
 import random
-from datetime import date
+from datetime import UTC, date
 
 import aiohttp
 from dotenv import load_dotenv
@@ -54,6 +54,7 @@ from pipecat.transports.smallwebrtc.transport import SmallWebRTCTransport
 from pipecat.transports.websocket.fastapi import FastAPIWebsocketParams, FastAPIWebsocketTransport
 from pipecat.workers.runner import WorkerRunner
 
+import cekura_observe  # Observability: POST call metadata to Cekura on disconnect
 from mock_backend import BOUQUETS, KNOWN_CUSTOMERS
 
 load_dotenv(override=True)
@@ -429,6 +430,24 @@ async def run_bot(
     @transport.event_handler("on_client_disconnected")
     async def on_client_disconnected(transport, client):
         logger.info("Client disconnected")
+
+        # ── Cekura Observability (fire-and-forget, never raises) ───────────────
+        # bot-gpt.py has no call_state; pass metadata-only with an empty
+        # call_state dict.  Transcript turns are extracted from LLM context
+        # messages (context is in scope via closure).
+        # TODO: capture order state into a lightweight call_state if richer
+        #       observability is needed (urgency, summary, etc.) for this bot.
+        _ts_turns = cekura_observe._turns_from_context_messages(context.messages)
+        from datetime import datetime
+        _call_id = f"gpt-{datetime.now(UTC).strftime('%Y%m%dT%H%M%SZ')}-{(from_number or 'unknown').replace('+', '')}"
+        await cekura_observe.observe_call(
+            {},  # no call_state for this bot
+            call_id=_call_id,
+            customer_number=from_number or None,
+            transcript_turns=_ts_turns,
+        )
+        # ─────────────────────────────────────────────────────────────────────
+
         await worker.cancel()
 
     runner = WorkerRunner(handle_sigint=False)
