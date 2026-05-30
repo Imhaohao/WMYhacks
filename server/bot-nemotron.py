@@ -127,6 +127,54 @@ async def _send_owner_sms(call_state: CallState, body: str) -> None:
         logger.error(f"SMS error: {exc}")
 
 
+# Hold strong references to fire-and-forget background tasks so the event loop
+# doesn't garbage-collect (and silently cancel) them mid-flight.
+_BG_TASKS: set[asyncio.Task] = set()
+
+
+def _spawn_bg(coro) -> asyncio.Task:
+    """Schedule a coroutine as a retained background task."""
+    task = asyncio.create_task(coro)
+    _BG_TASKS.add(task)
+    task.add_done_callback(_BG_TASKS.discard)
+    return task
+
+
+async def _send_owner_email(call_state: CallState, subject: str, body: str) -> None:
+    """Email the owner this voicemail via Resend's HTTPS API. Called by
+    finish_voicemail.
+
+    No SMTP password: authenticates with RESEND_API_KEY (Bearer token). Recipient
+    is OWNER_EMAIL (actions.owner_email()); sender is EMAIL_FROM, defaulting to
+    Resend's onboarding@resend.dev test sender which needs no domain verification
+    (it can only deliver to your own Resend account email — set EMAIL_FROM to an
+    address on a verified domain to reach any recipient). Best-effort: logs on
+    failure, never raises."""
+    import actions  # OWNER_EMAIL resolution
+
+    api_key = os.getenv("RESEND_API_KEY")
+    if not api_key:
+        logger.warning("Owner email NOT sent — set RESEND_API_KEY in .env")
+        return
+
+    to_addr = actions.owner_email()
+    from_addr = os.getenv("EMAIL_FROM", "onboarding@resend.dev")
+    try:
+        async with aiohttp.ClientSession() as session:
+            async with session.post(
+                "https://api.resend.com/emails",
+                headers={"Authorization": f"Bearer {api_key}"},
+                json={"from": from_addr, "to": [to_addr], "subject": subject, "text": body},
+            ) as resp:
+                if resp.status not in (200, 201):
+                    logger.error(f"Resend email failed ({resp.status}): {await resp.text()}")
+                    return
+        call_state["voicemail"]["email_sent"] = True
+        logger.info(f"Owner email sent to {to_addr}: {subject!r}")
+    except Exception as exc:
+        logger.error(f"Owner email error: {exc}")
+
+
 # ─── Voice ID resolution — owner clone with consent guard ────────────────────
 
 
@@ -618,10 +666,16 @@ async def run_bot(
             {k: v for k, v in msg.items() if k not in ("triage",)},
         )
 
-        # Auto-SMS the owner on urgent messages
-        if urgency == "urgent":
-            sms_body = f"Urgent voicemail: {summary}"[:160]
-            await _send_owner_sms(call_state, sms_body)
+        # Notify the owner about every completed voicemail — fires now, as the
+        # agent tells the caller it'll pass the message along. Both channels are
+        # fire-and-forget so neither round-trip delays the spoken goodbye:
+        #   • SMS  via Twilio (TWILIO_PHONE_NUMBER → OWNER_PHONE_NUMBER)
+        #   • Email via Resend (RESEND_API_KEY → OWNER_EMAIL)
+        sms_body = (f"Urgent voicemail: {summary}" if urgency == "urgent" else summary)[:160]
+        _spawn_bg(_send_owner_sms(call_state, sms_body))
+
+        email_subject = f"[{urgency.upper()}] Voicemail from {name}"
+        _spawn_bg(_send_owner_email(call_state, email_subject, summary))
 
         await params.result_callback(
             {
