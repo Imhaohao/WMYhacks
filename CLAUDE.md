@@ -4,7 +4,9 @@ Guidance for AI agents working in this repository (YC Voice Agents Hackathon —
 
 ## Model Routing (Executive Delegation)
 
-The main agent here is the **flagship model** (for example, GPT-5.5 or an Opus-class model) — treat it as the executive. Delegate downward whenever the task fits a cheaper or more specialized model, and only keep work on the flagship model when it genuinely needs that level of capability. Approximate cost ratio: **flagship ≈ 5× Sonnet ≈ 60× Haiku ≈ free for local Ollama** (compute only, no network, slower).
+The main agent routes work; it does **not** implement everything on the most expensive model. Approximate cost ratio: **flagship (Opus) ≈ 5× Sonnet ≈ 60× Haiku ≈ free for local Ollama** (compute only, no network, slower).
+
+**Hackathon default:** use **Sonnet** for implementation when a spec or handoff doc exists (`P3_NEXT.md`, `INTEGRATION_P3.md`, a agreed plan). Use **Opus/flagship** only for routing, ambiguous architecture, cross-team coordination, or tasks in "Stay on the flagship" below. Do **not** set Opus as the default Claude Code model for coding loops — one long Opus session with tools can burn millions of input tokens while output stays tiny.
 
 Delegation mechanisms:
 - **Cloud (Anthropic) subagents**: `Agent` tool with `model: "sonnet" | "haiku" | "opus"`.
@@ -35,25 +37,54 @@ This machine often runs a **dev server**, **voice-agent processes**, and **large
 | Long local inference (35B, R1) | Background shell or single serial job; use fast lane for anything else |
 | Running the bot + a WebRTC/voice check | Run `uv run bot-*.py` in a background terminal; verify in the browser in parallel |
 | Dependent steps (A must finish before B) | Serial — no fake parallelism |
+| Scoped implementation with a written spec | Sonnet (or Haiku for config/tests) — not Opus |
+| Lint / pyright / pytest fix loops | Sonnet or Haiku subagent |
+| Planning, critique, sponsor strategy (no code yet) | Short Opus turn, then **new session** to implement |
 
 Before starting another heavy job, consider what is already running (a dev server, `ollama run`, a bot process). If the user reports slowness or swap, **reduce concurrent local models** and **background the slowest work** instead of adding another blocking call.
 
+### Token budget and session hygiene
+
+Agent billing is **`tokens_in ≈ (system + history + tool output) × turns`**, not "lines of code written." A 114:1 input-to-output ratio means context re-read dominates — normal for long tool loops, expensive on Opus.
+
+**Session rules**
+
+- **One session per deliverable** — do not mix planning, unrelated repo questions, skills transfer, and a multi-file build in one Opus thread.
+- **Start fresh between phases** — after planning, after a large build, before handoff docs: `/clear`, new chat, or `claude --resume` only when continuing the *same* task.
+- **Do not re-paste long briefs** — say "follow `server/P3_NEXT.md` task N" instead of quoting 200+ lines again.
+- **Cap tool bloat** — prefer `rg` / targeted reads over full-file reads; never read `uv.lock` or `.venv/`; avoid re-reading the same file every turn unless it changed.
+- **Stop the loop** — if a task needs many tool rounds, delegate the mechanical tail to Sonnet/Haiku or split into a new session with a one-paragraph handoff.
+
+**Default delegations (do these without asking)**
+
+| Work | Model |
+|---|---|
+| Tests for a known module | Sonnet |
+| ruff / pyright / pytest fix loops | Sonnet or Haiku |
+| Env/AWS/SMTP config + smoke test | Haiku |
+| Pipecat frame hook with acceptance criteria | Sonnet |
+| Two-line integration diff with frozen contract | Sonnet (flagship only if touching another owner's file without approval) |
+
 ### Stay on the flagship model (executive — do not delegate)
 
-- Multi-file refactors, architecture decisions, ambiguous specs.
-- Long-context synthesis (reading large parts of the repo to answer one question).
+- Architecture decisions or **ambiguous** specs with no written acceptance criteria.
+- Cross-owner coordination (P1/P2/P3 file boundaries, interface freeze changes).
 - Routing decisions themselves — picking which subagent or model to use.
-- Debugging where the root cause may span unfamiliar files.
+- Debugging where the root cause may span many unfamiliar subsystems **after** Sonnet has failed once.
 - Anything where a wrong answer is expensive to undo (auth, credentials, billed external services like cloud deploys or telephony).
 
-### Delegate to Sonnet 4.6 — fast, capable coding
+**Not flagship work** (even if the agent "could" do it): single-module implementation, handoff docs, integration shims, test suites, config, and refactors with a clear spec — use Sonnet/Haiku/local fast lane.
 
-`Agent(model: "sonnet", ...)`
+### Delegate to Sonnet 4.6 — default implementation lane
 
-- Single-file or well-scoped code changes with a clear spec.
+`Agent(model: "sonnet", ...)` — **prefer this over inline Opus** for any task with a clear spec.
+
+- Single-file or well-scoped code changes with a clear spec (including tasks from `P3_NEXT.md`).
 - Writing or updating tests for a known module.
 - Code review of a small diff.
 - Mechanical refactors (rename, extract function, inline) once the plan is decided.
+- Pipecat integration hooks, CLI extensions, and "wire X into Y" when the contract is frozen.
+- Lint/typecheck/test fix loops after the design is settled.
 - Anything the flagship model *could* do but where the path is already obvious — Sonnet finishes faster and ~5× cheaper.
 
 ### Delegate to Haiku 4.5 — cheap, fast, simple
@@ -128,10 +159,10 @@ Rule of thumb: stay in the fast lane unless you have a specific reason (hard rea
 
 1. Is the data **sensitive** (cannot leave the machine) or are we **offline**? → local Ollama, fast lane (pick model from table). Hard constraint, comes first. **Note:** "local" means `compute-box` by default (it's still your own hardware over a private Tailscale link); fall back to this machine if it's down or the job needs >16GB RAM. See "Where local jobs run".
 2. Is this a **bulk batch** (hundreds–thousands of similar calls) where total cost matters more than wall-clock per item? → local fast lane (`llama3.2:3b` for classification, `qwen2.5-coder:7b` for code, `qwen2.5:7b` for general prose, `gemma3:4b` for multilingual). ~5–10 s/call vs Haiku's ~1 s/call, but $0 vs metered.
-3. Otherwise, can **Haiku** do it correctly with a one-shot prompt? → Haiku subagent. Still the throughput winner for low-volume work.
-4. If not, can **Sonnet** do it given a clear spec? → write the spec on the flagship model, then hand off to Sonnet.
+3. Otherwise, can **Haiku** do it correctly with a one-shot prompt? → Haiku subagent.
+4. Can **Sonnet** do it given a clear spec or handoff doc? → **Sonnet subagent or inline Sonnet** (default for implementation — do not escalate to Opus first).
 5. Need deeper reasoning, multilingual nuance, or top local code quality? → local **deliberate lane** (`deepseek-r1:14b`, `gemma4:31b-mlx`, `qwen3.5:35b-mlx`). Pay the 30s–3min latency for the quality bump.
-6. Otherwise → **handle inline on the flagship model**.
+6. Otherwise → **flagship inline** for routing, synthesis, or ambiguous work only — not for routine coding.
 
 ### Reporting agent activity in turn summaries
 

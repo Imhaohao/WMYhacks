@@ -19,6 +19,7 @@ Run locally::
 """
 
 import os
+from pathlib import Path
 
 import aiohttp
 from dotenv import load_dotenv
@@ -50,16 +51,18 @@ from pipecat.transports.websocket.fastapi import FastAPIWebsocketParams, FastAPI
 from pipecat.turns.user_turn_strategies import FilterIncompleteUserTurnStrategies
 from pipecat.workers.runner import WorkerRunner
 
-from interfaces import TOOL_REGISTRY, CallState, build_system_instruction, default_call_state
-from nemotron_llm import VLLMOpenAILLMService
-from nvidia_stt import NVidiaWebSocketSTTService
+_ENV_DIR = Path(__file__).resolve().parent
+load_dotenv(_ENV_DIR / ".env", override=True)
+load_dotenv(_ENV_DIR / ".env.local", override=True)
 
 # ── P2 / P3 modules append to TOOL_REGISTRY at import time ────────────────────
 # Add an import line here once each teammate's module is ready:
 #   import calendar_tools   # P2 — appends book_callback_slot, get_calendar_availability
-#   import persona_tools    # P3 — appends update_caller_snapshot, lookup_persona
+from interfaces import TOOL_REGISTRY, CallState, build_system_instruction, default_call_state
+from nemotron_llm import VLLMOpenAILLMService
+from nvidia_stt import NVidiaWebSocketSTTService
 
-load_dotenv(override=True)
+import persona_tools  # isort: skip  # P3 — appends 4 tools and on_call_finished hook
 
 
 # ─── Twilio helper ────────────────────────────────────────────────────────────
@@ -341,14 +344,17 @@ async def run_bot(
             async def bound(params, **kwargs):
                 return await fn(params, call_state=call_state, **kwargs)
             new_params = [p for k, p in sig.parameters.items() if k != "call_state"]
-            bound.__signature__ = sig.replace(parameters=new_params)
+            setattr(bound, "__signature__", sig.replace(parameters=new_params))
             return bound
         return fn
 
     all_tools = p1_tools + [bind_call_state(fn) for fn in TOOL_REGISTRY]
 
     # ── P2: inject persona_context before building system instruction ──────────
-    # TODO (P2): set call_state["persona_context"] = await fetch_owner_context(from_number)
+    from owner_config import build_persona_context
+
+    call_state["persona_context"] = build_persona_context()
+    # TODO (P2): merge calendar / iMessage analysis on top of owner_config baseline
 
     system_instruction = build_system_instruction(call_state)
 
@@ -389,10 +395,15 @@ async def run_bot(
         ),
     )
 
+    # P3 — passthrough processor that infers caller tone from final transcripts
+    # (no LLM round-trip). Sits between stt and the user aggregator.
+    tone_listener = persona_tools.make_transcript_tone_processor(call_state)
+
     pipeline = Pipeline(
         [
             transport.input(),
             stt,
+            tone_listener,
             user_aggregator,
             llm,
             tts,
@@ -425,6 +436,7 @@ async def run_bot(
     @transport.event_handler("on_client_disconnected")
     async def on_client_disconnected(transport, client):
         logger.info(f"Client disconnected — call_state summary: {call_state['voicemail']}")
+        persona_tools.on_call_finished(call_state)  # P3 — persist voicemail (never raises)
         await worker.cancel()
 
     runner = WorkerRunner(handle_sigint=False)
