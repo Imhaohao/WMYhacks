@@ -11,6 +11,10 @@ dependencies = [
     "python-dotenv>=1.0.0",
     "python-multipart>=0.0.9",
     "uvicorn[standard]>=0.32.0",
+    # Part B: real Google Calendar availability (ingest/gcal.py).
+    "google-api-python-client>=2.0.0",
+    "google-auth-httplib2>=0.2.0",
+    "google-auth-oauthlib>=1.2.0",
 ]
 
 [dependency-groups]
