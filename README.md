@@ -338,3 +338,4 @@ This spins up anything from 10–20 evaluators (what Cekura calls test cases), r
 - [Cekura skills](https://docs.cekura.ai/mcp/skills) — all slash commands
 - [Pipecat integration](https://docs.cekura.ai/documentation/integrations/pipecat/automated)
 - [Cekura docs](https://docs.cekura.ai) · [dashboard](https://dashboard.cekura.ai)
+# appliedintelhacks
