@@ -22,12 +22,6 @@ function waitForIceGathering(pc: RTCPeerConnection): Promise<void> {
   })
 }
 
-function fmt(sec: number): string {
-  const m = Math.floor(sec / 60)
-  const s = sec % 60
-  return `${m}:${s.toString().padStart(2, "0")}`
-}
-
 /**
  * A phone-call UI for the bot, rendered inside the iPhone mockup. Establishes a
  * SmallWebRTC connection to the bot's `/api/offer` endpoint (the same one the
@@ -43,7 +37,6 @@ export function PhoneCallExperience({
   phone: string
 }) {
   const [status, setStatus] = useState<CallStatus>("idle")
-  const [durationSec, setDurationSec] = useState(0)
   const [muted, setMuted] = useState(false)
   const [botLevel, setBotLevel] = useState(0)
   const [errorMsg, setErrorMsg] = useState<string | null>(null)
@@ -164,14 +157,6 @@ export function PhoneCallExperience({
     }
   }, [baseUrl, cleanup, startAnalyser, endCall])
 
-  // Call timer.
-  useEffect(() => {
-    if (status !== "active") return
-    setDurationSec(0)
-    const id = window.setInterval(() => setDurationSec((d) => d + 1), 1000)
-    return () => clearInterval(id)
-  }, [status])
-
   // Tear down on unmount.
   useEffect(() => cleanup, [cleanup])
 
@@ -213,7 +198,7 @@ export function PhoneCallExperience({
         <div className="mt-1 h-4 text-[11px] uppercase tracking-[0.3em] text-white/70">
           {status === "idle" && <span className="text-emerald-300/90">Incoming call</span>}
           {status === "connecting" && <span className="animate-pulse">Connecting…</span>}
-          {status === "active" && <span className="text-emerald-300/90">{fmt(durationSec)}</span>}
+          {status === "active" && <span className="text-emerald-300/90">On call</span>}
           {status === "ended" && <span className="text-white/50">Call ended</span>}
           {status === "error" && <span className="text-red-300">Call failed</span>}
         </div>

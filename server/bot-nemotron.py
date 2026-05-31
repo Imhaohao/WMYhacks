@@ -481,7 +481,7 @@ async def run_bot(
             return
         _hangup["finalized"] = True
         logger.info(
-            "Finalizing call (%s) — call_state summary: %s",
+            "Finalizing call ({}) — call_state summary: {}",
             source,
             call_state["voicemail"],
         )
