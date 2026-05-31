@@ -244,3 +244,11 @@ server/credentials.json
 server/token.json
 server/availability.json
 server/ingest_contacts.json
+server/discord_export.json
+server/discord_export/
+
+# Google Calendar OAuth refresh token (never commit)
+server/google_token.json
+
+# Gmail OAuth refresh token (never commit)
+server/google_gmail_token.json

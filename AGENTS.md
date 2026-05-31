@@ -178,12 +178,25 @@ This makes cost tracking and quality regressions visible across sessions.
 
 ## Project Orientation
 
-- This repository is the **YC Voice Agents Hackathon** starter — a voice agent built with [Pipecat](https://pipecat.ai). Demo bot **Field & Flower**: a neighborhood flower shop where callers order a bouquet for delivery while the bot looks up the catalog, captures delivery details, and places the order. All backend calls are **mocked** (`server/mock_backend.py`), so the starter runs with nothing but AI service keys.
-- All application code lives in `server/`, managed by the [`uv`](https://docs.astral.sh/uv/) package manager (Python 3.11+).
-- There are **two bot versions**:
-  - **Version 1 — `bot-gpt.py`**: STT/TTS via [Gradium](https://gradium.ai), LLM via OpenAI Responses API (GPT-4.1). Needs only `GRADIUM_API_KEY` + `OPENAI_API_KEY`.
-  - **Version 2 — `bot-nemotron.py`**: NVIDIA Nemotron STT (`nvidia_stt.py`) + Nemotron 3 Super 120B LLM (`nemotron_llm.py`), TTS via Gradium. Needs `GRADIUM_API_KEY` + `NVIDIA_ASR_URL` + `NEMOTRON_LLM_URL` (NVIDIA endpoints are shared at the start of the hackathon day).
-- Transports: **SmallWebRTC** for local dev (browser), **Twilio** for production telephony. Deploy target is **Pipecat Cloud**.
+- **Hackathon product spec:** [`PLAN.md`](PLAN.md) — 3-person **Persona Voicemail Agent**
+  (owner proxy on inbound calls). Win thesis: scales, persists, and **learns** via the
+  Cekura auto-improve loop. Priority ladder: Tier 0 (Nemotron voicemail + persona loader
+  + caller snapshot) → Tier 1 (Cekura loop, AWS persistence, Twilio) → Tier 2+ (live
+  calendar, voice clone, email) → Tier 3 (iMessage ingest, Pipecat Cloud).
+- All application code lives in `server/`, managed by [`uv`](https://docs.astral.sh/uv/)
+  (Python 3.11+).
+- **Primary demo bot — `bot-nemotron.py`** (NVIDIA eligibility). Pipeline: Gradium STT →
+  Nemotron 3 Super 120B LLM → Gradium TTS (optional owner voice clone). Do not switch
+  the demo to `bot-gpt.py` without explicit approval.
+- **Person 2 shipped (see PLAN.md build status):** `persona_context.py` +
+  `persona_context.md`, `server/eval/` (mock Cekura loop + auto-improve), `server/ingest/`
+  (iMessage / Calendar / agent-context → persona file). Refresh live context:
+  `uv run python -m ingest.refresh`.
+- **Person 3 lane:** caller snapshot (`caller_snapshot.py`), action outbox → MCP drain
+  (`actions.py`, `action_bridge.py`), AWS persistence (`persistence.py`).
+- Transports: **SmallWebRTC** (local dev), **Twilio** (telephony + owner SMS). Deploy
+  target: **Pipecat Cloud**.
+- Legacy starter (`bot-gpt.py`, `mock_backend.py`) remains for reference; not the demo path.
 
 ## Expected Workflow
 
@@ -203,9 +216,18 @@ Run these from the `server/` directory.
 - Run Version 2 (Nemotron): `ENV=local uv run bot-nemotron.py`
 - Lint: `uv run ruff check .`
 - Typecheck: `uv run pyright`
-- Tests: `uv run pytest` (e.g. `test_nemotron_llm.py`)
+- Tests: `uv run pytest` (e.g. `test_persona_context.py`, `eval/test_eval.py`, `ingest/test_ingest.py`)
+- **Eval loop (P2, mock or live):** `uv run python -m eval.run_evals` ·
+  `uv run python -m eval.improve --rounds 1` (demo finale: FAIL→PASS flip)
+- **Live persona refresh (P2):** `uv run python -m ingest.refresh`
 
 `ENV=local` skips the Krisp filter, which is only available when deployed to Pipecat Cloud.
+
+### MCP & connectors
+
+Before any Cekura / Gmail / Calendar tool call, read [`MCP_AGENTS.md`](MCP_AGENTS.md)
+(session roles, env checklist, outbox drain SOP, verification). Per-client wiring
+lives in [`docs/agent-setup/`](docs/agent-setup/).
 
 ## Local / Browser Checks
 

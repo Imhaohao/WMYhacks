@@ -30,13 +30,121 @@ There will be engineers from Cekura, Daily, NVIDIA, AWS, and Twilio available to
 Judging will start at 6:00. In general, the judges want to showcase interesting projects rather than just pick winners. So don't worry too much about what the judges are looking for in a project. Build something that demonstrates creativity, is interesting on a technical level, or solves a real problem! But do keep in mind that the judges want to see great examples of using Cekura to improve voice agent performance, and using open source models from NVIDIA.
 
 
-# Tech stack and starting points.
+# Tech stack and starting points
 
-This repo contains two versions of a voice agent built with [Pipecat](https://pipecat.ai).
+This repo contains two Pipecat voice-agent entry points:
 
-The demo bot **Field & Flower** is a neighborhood flower shop: callers order a bouquet for delivery while the bot looks up the catalog, captures delivery details, and places the order. All backend calls are mocked, so the starter runs with nothing but AI service keys.
+| Bot | Use case |
+|---|---|
+| **`bot-nemotron.py`** | **Primary hackathon build** — personal voicemail agent (Gotchu) on Nemotron + Gradium |
+| **`bot-gpt.py`** | Original starter — **Field & Flower** flower-shop demo on GPT-4.1 + Gradium |
 
-## Version 1 — GPT-4.1
+The Nemotron bot answers calls on the owner's behalf, captures a complete message, adapts tone to the caller, and routes notifications (SMS, email, calendar) while persisting each call to AWS or local fallback storage.
+
+The GPT bot is unchanged from the Pipecat starter: callers order a bouquet from a mocked catalog (`mock_backend.py`).
+
+## Architecture
+
+### Voice pipeline (`bot-nemotron.py`)
+
+Each call runs one Pipecat pipeline:
+
+```
+Browser (WebRTC) or Twilio phone
+        │
+        ▼
+  Transport (SmallWebRTC / Twilio WebSocket)
+        │
+        ▼
+  NVIDIA Nemotron STT  ──►  P3 tone listener  ──►  LLM context + VAD
+        │                         │
+        │                         └── infers caller tone from final transcripts
+        ▼
+  Nemotron 3 Super 120B (vLLM on AWS)  +  function tools
+        │
+        ▼
+  Gradium TTS (cloned owner voice)
+        │
+        ▼
+  Audio out + transcript
+```
+
+On disconnect, **P3** persists the voicemail record (snapshot + actions taken) via `persona_tools.on_call_finished()`.
+
+### Per-call state (`interfaces.py`)
+
+All teammates share one `CallState` dict per call:
+
+| Key | Owner | Purpose |
+|---|---|---|
+| `voicemail` | **P1** | Transcript, summary, caller number, action items, SMS/email flags |
+| `caller_snapshot` | **P3** | Live tone, urgency, relationship, persona match |
+| `persona_context` | **P2** | Owner availability, priority contacts, message digest — injected into the system prompt |
+
+Tools register through a single **`TOOL_REGISTRY`** list. Each module appends its handlers at import time; `bot-nemotron.py` binds `call_state` into tools that need it.
+
+**LLM tools (current):**
+
+| Tool | Owner | When the agent uses it |
+|---|---|---|
+| `record_message` | P1 | Caller name, callback number, subject, and urgency are confirmed |
+| `notify_owner_sms` | P1 | Urgent voicemail — Twilio SMS to owner |
+| `end_call` | P1 | After goodbye — hangs up |
+| `update_caller_snapshot` | P3 | Learns caller details or re-infers tone from wording |
+| `lookup_persona` | P3 | Matches Twilio caller ID to contacts; exact-name allowlist fallback for WebRTC demos |
+| `get_calendar_context_for_caller` | P3 | After contact approval only, derives one caller-facing reason from Calendar without exposing the schedule |
+| `send_owner_email` | P3 | Sends owner a summary email (SMTP or outbox fallback) |
+| `book_callback_slot` | P3 | Tentative calendar callback (Calendar MCP or outbox fallback) |
+
+Calendar read is wired through `google_calendar.py`: free/busy checks support
+callbacks, while contact-gated context answers return at most one safe reason.
+
+### Persistence — the agent's memory (`persistence.py`)
+
+Finished voicemails and Cekura eval runs are written through one API. Backend resolution (first match wins):
+
+1. **DynamoDB** — table `ff-voicemails` (override with `PERSIST_DDB_TABLE`)
+2. **S3** — bucket from `PERSIST_S3_BUCKET`
+3. **Local file** — `server/aws_store/records.jsonl` (demo default when AWS is unavailable)
+
+Requires AWS credentials in env for the cloud path. No raw audio is stored — structured fields only.
+
+The cleaned derived owner persona is also stored as one overwriteable cloud
+record in the same DynamoDB table, with optional S3 fallback. Run
+`uv run python -m ingest.refresh` to republish it after local context changes.
+At startup the voice agent reads the cloud persona first, so Pipecat Cloud and
+other machines share the same context without copying a generated local file.
+
+Queued email/calendar actions land in `server/outbox/actions.jsonl` until `action_bridge.py` or live connectors fulfill them.
+
+### Owner onboarding
+
+| Component | Path | Role |
+|---|---|---|
+| Web UI | `web/` | Landing, setup wizard, try-call page (Vite + React) |
+| Onboarding API | `server/onboarding_api.py` | FastAPI — saves `owner_config.json`, vCard upload, message digest |
+| Owner config | `server/owner_config.py` | Builds `persona_context` for the system prompt at call start |
+| Contacts | `server/contacts.py` + `contacts.vcf` | Known-caller lookup by phone number; exact-name WebRTC demo allowlist |
+
+Run the onboarding stack:
+
+```bash
+# Terminal 1 — API on :8787
+cd server && uv run python onboarding_api.py
+
+# Terminal 2 — UI on :5173
+cd web && npm install && npm run dev
+```
+
+See [`web/README.md`](web/README.md) for routes and details.
+
+### Environment and secrets
+
+The Nemotron bot loads env from **`server/.env`** then **`server/.env.local`** (local overrides). Copy `server/.env.example` to `.env` and put machine-specific keys in `.env.local` — neither file should be committed.
+
+Integration docs for teammates: [`server/INTEGRATION_P3.md`](server/INTEGRATION_P3.md), [`server/P3_NEXT.md`](server/P3_NEXT.md).
+
+## Version 1 — GPT-4.1 (Field & Flower starter)
 
 You can start with this before the hackathon, if you want to. Or test GPT-4.1 and Nemotron side-by-side during the hackathon, using Cekura.
 
@@ -48,7 +156,7 @@ This bot only requires a Gradium API key and an OpenAI API key. Sign up for free
 - **Transports:** SmallWebRTC (local dev) and [Twilio](https://www.twilio.com/en-us) (production telephony)
 - **Deploy target:** [Pipecat Cloud](https://pipecat.daily.co)
 
-## Version 2
+## Version 2 — Nemotron (Gotchu voicemail agent)
 
 NVIDIA models hosted on AWS, available during the hackathon. We'll share endpoints for the NVIDIA ASR (STT) and LLM models at the beginning of the day.
 
@@ -81,8 +189,9 @@ Get the bot running over WebRTC in your browser before you push to the cloud or 
 
    ```bash
    cp .env.example .env
-   # Edit .env and fill in OPENAI_API_KEY, GRADIUM_API_KEY.
-   # TWILIO_* keys are only needed when you wire up the phone (next section).
+   # Fill in GRADIUM_API_KEY (required) and Nemotron URLs for bot-nemotron.py.
+   # Optional: copy secrets to .env.local (loaded second, gitignored).
+   # TWILIO_* keys are only needed when you wire up the phone.
    ```
 
 3. **Install dependencies:**
@@ -94,9 +203,8 @@ Get the bot running over WebRTC in your browser before you push to the cloud or 
 4. **Run the bot:**
 
    ```bash
-   # run one or the other of these
-   uv run bot-gpt.py
-   uv run bot-nemotron.py
+   ENV=local uv run bot-nemotron.py   # primary — voicemail agent
+   # uv run bot-gpt.py                # starter — flower shop demo
    ```
 
    Open [http://localhost:7860](http://localhost:7860) and click **Connect** to start talking. First launch takes ~20s while Pipecat downloads VAD and turn-detection models.

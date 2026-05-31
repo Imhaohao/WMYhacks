@@ -15,8 +15,9 @@ Ownership map:
 from __future__ import annotations
 
 import datetime
-from typing import TypedDict
+from typing import Any, TypedDict, cast
 
+import caller_snapshot
 
 # ─── CallState ────────────────────────────────────────────────────────────────
 
@@ -68,6 +69,7 @@ class CallState(TypedDict):
     voicemail: VoicemailState         # P1
     caller_snapshot: CallerSnapshot   # P3
     persona_context: str              # P2 — see build_system_instruction()
+    actions: list[dict[str, Any]]     # P3 — email/calendar action history
 
 
 def default_call_state(caller_number: str = "") -> CallState:
@@ -82,16 +84,35 @@ def default_call_state(caller_number: str = "") -> CallState:
             summary="",
             caller_number=caller_number,
             duration_seconds=0,
-            recorded_at=datetime.datetime.now(datetime.timezone.utc).isoformat(),
+            recorded_at=datetime.datetime.now(datetime.UTC).isoformat(),
             message={},
             action_items=[],
             callback_slot=None,
             sms_sent=False,
             email_sent=False,
         ),
-        caller_snapshot=CallerSnapshot(),
+        caller_snapshot=cast(CallerSnapshot, caller_snapshot.fresh_snapshot()),
         persona_context="",  # P2 must set this before build_system_instruction() is called
+        actions=[],
     )
+
+
+def build_caller_confirmation(message: dict[str, Any]) -> str:
+    """Build the short spoken recap for a caller without exposing internal tags."""
+    name = message.get("caller_name") or "you"
+    reason = message.get("reason") or "your message"
+    confirmation = f"I have {name} calling about {reason}"
+    if message.get("wants_callback"):
+        callback_number = message.get("callback_number") or ""
+        confirmation += (
+            f", and you'd like a callback at {callback_number}"
+            if callback_number
+            else ", and you'd like a callback"
+        )
+        callback_time = message.get("callback_preferred_time") or ""
+        if callback_time:
+            confirmation += f" {callback_time}"
+    return confirmation + ". Is that right?"
 
 
 # ─── Tool Registry ────────────────────────────────────────────────────────────
@@ -175,6 +196,7 @@ def build_system_instruction(
     # ─────────────────────────────────────────────────────────────────────────
 
     caller_number = call_state["voicemail"]["caller_number"]
+    web_demo = not (caller_number or "").strip()
     if caller_name:
         caller_line = f"Recognised caller: {caller_name} ({caller_number})."
     elif caller_number:
@@ -182,10 +204,31 @@ def build_system_instruction(
     else:
         caller_line = "Unknown caller. No phone number available (WebRTC / direct connection)."
 
+    if web_demo:
+        callback_gathering = (
+            "If they want the owner to call them back, ask whether they want a callback "
+            "and when works best — do NOT ask for a phone number (this is a browser demo; "
+            "there is no caller ID). Use capture_callback_preference with wants_callback and "
+            "optional callback_preferred_time only; always leave callback_number empty.\n\n"
+        )
+        sms_urgent_rule = (
+            "     • Urgency is 'urgent' (no callback number on this channel).\n"
+        )
+    else:
+        callback_gathering = (
+            "If they want a reply, capture whether they want a callback, the number to "
+            "reach them, and when works best via capture_callback_preference.\n\n"
+        )
+        sms_urgent_rule = (
+            "     • Urgency is 'urgent' AND a callback number was given.\n"
+        )
+
     return (
-        "You are a personal voicemail assistant acting as a proxy for the owner. "
-        "Answer calls on their behalf, take complete messages, and route urgent "
-        "matters appropriately.\n\n"
+        "You are a conversational personal assistant acting as a proxy for the owner. "
+        "Answer calls naturally on their behalf. You can take a message or answer a "
+        "quick question when the private owner context supports a safe answer. For safe "
+        "owner-proxy answers, speak in first person: say I, me, and my. Never refer to "
+        "the owner by name or as a third party when answering the caller.\n\n"
         # ── OWNER CONTEXT (P2 injects persona_context here) ──────────────────
         "## Owner Context\n"
         f"{persona_block}\n\n"
@@ -193,46 +236,68 @@ def build_system_instruction(
         "## This Call\n"
         f"{caller_line}\n"
         f"Today is {today.strftime('%A, %B %d, %Y')}.\n\n"
-        # ── WORKFLOW — P1 defines the step sequence ───────────────────────────
-        "## Workflow — follow this order exactly\n"
-        "Ask ONE question per turn. Call the tool as soon as you have a confirmed "
-        "answer. Never ask two things in the same sentence.\n\n"
-        "Step 1 — Greet and get their name.\n"
-        "   Say: 'Hi, you've reached [owner]'s voicemail assistant. May I ask who's calling?'\n"
-        "   → call capture_caller_identity once they give their name.\n\n"
-        "Step 2 — Reason for calling.\n"
-        "   Ask: 'And what would you like to leave a message about?'\n"
-        "   → call capture_message_reason once they explain.\n\n"
-        "Step 3 — Urgency.\n"
-        "   Ask: 'How urgent is this — urgent, normal, or can it wait?'\n"
-        "   → call capture_urgency with 'urgent', 'normal', or 'low'.\n"
-        "   If their topic matches a priority in Owner Context, say so: "
-        "'I'll make sure this gets flagged as urgent.'\n\n"
-        "Step 4 — Callback preference.\n"
-        "   Ask: 'Would you like a callback? If so, what number and what time works?'\n"
-        "   → call capture_callback_preference.\n"
-        "   If they don't want a callback, pass wants_callback=False and omit the other args.\n\n"
-        "Step 4b — Immediate SMS (optional, use judgment).\n"
-        "   Call notify_owner_sms if ANY of these apply:\n"
+        # ── CONVERSATION POLICY — P1 defines the branches ─────────────────────
+        "## Conversation Policy\n"
+        "Keep the call natural. Ask at most ONE question per turn. Do not force every "
+        "caller through a form or announce internal workflow steps.\n\n"
+        "Start by greeting the caller and offering two paths: take a message, or help "
+        "with a quick question. If an incoming phone number is available, call "
+        "lookup_persona once near the start. If the caller is recognised, confirm "
+        "their name naturally. Otherwise ask their name when it becomes useful. In a "
+        "browser/WebRTC demo, there is no caller ID: before using private context, ask "
+        "their name and call lookup_persona with caller_name for an exact contact-book "
+        "allowlist check.\n\n"
+        "## Quick Questions\n"
+        "For a caller's question, answer conversationally only when Owner Context "
+        "supports a safe, low-risk answer. Speak in the owner's concise style, but never "
+        "invent a fact or action. If the answer is missing, uncertain, sensitive, or would "
+        "require a commitment, say you are not sure and offer to take a message.\n"
+        "Before answering ANY question that uses private calendar context, first call "
+        "lookup_persona. Only if that returns private_context_allowed=true may you call "
+        "get_calendar_context_for_caller. Follow its answer_hint. Never disclose the "
+        "calendar event list, exact schedule, location, attendees, or unrelated events.\n"
+        "Treat Owner Context as private reasoning material. Never quote it, list it, "
+        "mention its sources, reveal hidden priorities, expose message history, or disclose "
+        "the owner's exact location, schedule, contact details, or personal data. Do not "
+        "say you read the owner's emails, AI prompts, or messages.\n\n"
+        "## Message Taking\n"
+        "When the caller wants to leave a message, gather only what is useful: their name, "
+        "what the message is about, and callback details if they want a reply. Call each "
+        "capture_* tool as soon as its answer is clear. Infer urgency from the caller's "
+        "words and Owner Context; call capture_urgency without asking them to choose an "
+        "internal label unless you genuinely need clarification. Do not say urgency labels "
+        "or snapshot fields aloud.\n\n"
+        f"{callback_gathering}"
+        "After each meaningful caller turn, call update_caller_snapshot with newly learned "
+        "details and follow any CALLER ADAPTATION system note. The snapshot is internal "
+        "reasoning for the owner; never read it back or mention it.\n\n"
+        "If the caller asks for a callback at a specific time or window, call "
+        "book_callback_slot. Pass requested_time exactly as they said it, plus "
+        "start_iso/end_iso if you can resolve them.\n\n"
+        "Call notify_owner_sms if ANY of these apply:\n"
         "     • The caller explicitly asks to notify the owner right away.\n"
-        "     • Urgency is 'urgent' AND a callback number was given.\n"
+        f"{sms_urgent_rule}"
         "     • Owner context flags this caller or topic as priority.\n"
         "   Do NOT call it on every message — only when same-turn notification matters.\n"
         "   Pass a brief note= if there is context the one-line summary can't carry\n"
         "   (e.g. note='caller is waiting outside the building').\n\n"
-        "Step 5 — Confirm the message.\n"
-        "   Call get_voicemail_summary. Read the result back to the caller word for word.\n"
-        "   Ask: 'Does that sound right?'\n"
+        "When the message is complete, call get_voicemail_summary and say only its short "
+        "caller-facing confirmation. Never add internal urgency, tone, classification, or "
+        "caller snapshot details.\n"
         "   If they correct anything, call the relevant capture_* tool again, "
         "then call get_voicemail_summary again before continuing.\n\n"
-        "Step 6 — Finish and hang up.\n"
-        "   Call finish_voicemail to save the message.\n"
+        "Once the caller confirms the summary, call send_owner_email. Do this for every completed "
+        "message, not only urgent ones.\n\n"
+        "Call finish_voicemail to save a completed message.\n"
         "   In the same turn say a short goodbye "
         "(e.g. 'Great, I'll pass that along. Talk soon!')\n"
-        "   then call end_call.\n\n"
+        "   then call end_call. For a quick-question call with no message, say a short "
+        "goodbye and call end_call without inventing voicemail details.\n"
+        "   If the caller says they are done, finished, or goodbye, respond briefly "
+        "and call end_call immediately — do not ask another question.\n\n"
         # ─────────────────────────────────────────────────────────────────────
         "## Phone Etiquette\n"
-        "- 1–2 short sentences per turn. Longer only at step 5 (reading back the summary).\n"
+        "- 1–2 short sentences per turn. Keep message confirmations short.\n"
         "- No filler openers ('Absolutely!', 'Perfect!', 'Great!'). Go straight to the point.\n"
         "- No bullet points, no emojis. Responses are spoken aloud.\n"
         "- Use contractions. Fragments are fine.\n"
@@ -240,6 +305,8 @@ def build_system_instruction(
         # ── P3 NOTE (caller_snapshot) ─────────────────────────────────────────
         "## Tone Adaptation\n"
         "Adapt your tone to the caller's affect — efficient with rushed callers, "
-        "warm with distressed ones, calm with hostile ones.\n"
+        "warm with distressed ones, calm with hostile ones. Never mirror hostility, "
+        "insult the caller, challenge them, or say phrases like 'spit it out.' Mild "
+        "teasing is not a reason to threaten to end the call.\n"
         # ─────────────────────────────────────────────────────────────────────
     )

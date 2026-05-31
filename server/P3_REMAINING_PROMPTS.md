@@ -76,6 +76,9 @@ Orientation for any agent picking these up:
 
 ## Prompt 2 — Live connector fulfillment + Cekura eval persistence (Tasks 4 & 5)
 
+> **Read first:** [`MCP_AGENTS.md`](../MCP_AGENTS.md) — session roles, outbox drain
+> SOP, Gmail dual-path, Calendar write-scope, and the Cekura persist flow.
+>
 > **Role:** You are wiring the Field & Flower agent's queued actions and evaluation
 > results into the **live MCP connectors** (Gmail, Google Calendar, Cekura). These
 > are grouped because all three are blocked on the same thing: a session that can

@@ -205,6 +205,39 @@ def _load_from_vcard() -> dict[str, dict[str, Any]]:
         return {}
 
 
+def _load_names_from_vcard() -> dict[str, dict[str, Any]]:
+    """Build an exact-name index without losing cards that share a number."""
+    path = _vcard_path()
+    if not path.exists():
+        return {}
+    try:
+        text = path.read_text(encoding="utf-8")
+    except OSError as exc:
+        logger.info(f"contacts: could not read vCard names '{path}' ({type(exc).__name__})")
+        return {}
+
+    index: dict[str, dict[str, Any]] = {}
+    for block in text.split("BEGIN:VCARD"):
+        name: str | None = None
+        relationship: str | None = None
+        numbers: list[str] = []
+        for raw_line in block.splitlines():
+            line = raw_line.strip()
+            upper = line.upper()
+            if upper.startswith("FN") and ":" in line:
+                name = line.split(":", 1)[1].strip()
+            elif upper.startswith("TEL") and ":" in line:
+                numbers.append(line.split(":", 1)[1].strip())
+            elif upper.startswith("CATEGORIES") and ":" in line:
+                relationship = line.split(":", 1)[1].split(",", 1)[0].strip() or None
+        if name and any(normalize_number(number) for number in numbers):
+            index.setdefault(
+                name.casefold(),
+                {"name": name, "relationship": relationship, "source": "vcard"},
+            )
+    return index
+
+
 # ─── Public index ────────────────────────────────────────────────────────────
 
 
@@ -219,13 +252,23 @@ def build_contact_index() -> dict[str, dict[str, Any]]:
 
 # Built once at import time; the live path just does dict lookups.
 _INDEX: dict[str, dict[str, Any]] = build_contact_index()
+_NAME_INDEX: dict[str, dict[str, Any]] = _load_names_from_vcard()
+for _entry in _INDEX.values():
+    _name = str(_entry.get("name") or "").strip()
+    if _name:
+        _NAME_INDEX.setdefault(_name.casefold(), _entry)
 
 
 def reload_index() -> int:
     """Rebuild the in-memory index (e.g. after exporting a fresh vCard). Returns
     the number of numbers indexed."""
-    global _INDEX
+    global _INDEX, _NAME_INDEX
     _INDEX = build_contact_index()
+    _NAME_INDEX = _load_names_from_vcard()
+    for entry in _INDEX.values():
+        name = str(entry.get("name") or "").strip()
+        if name:
+            _NAME_INDEX.setdefault(name.casefold(), entry)
     return len(_INDEX)
 
 
@@ -238,6 +281,19 @@ def lookup(number: str | None) -> dict[str, Any] | None:
     if not key:
         return None
     return _INDEX.get(key)
+
+
+def lookup_name(name: str | None) -> dict[str, Any] | None:
+    """Resolve an exact, unique contact name for browser-demo verification.
+
+    Real phone calls should use ``lookup`` with Twilio caller ID. The name path
+    exists only because WebRTC has no inbound number; it confirms that a caller
+    name is allowlisted without exposing the owner's contact book.
+    """
+    normalized = str(name or "").strip().casefold()
+    if not normalized:
+        return None
+    return _NAME_INDEX.get(normalized)
 
 
 def index_size() -> int:

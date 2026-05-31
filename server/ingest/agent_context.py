@@ -18,6 +18,7 @@ import statistics
 from collections import Counter
 from pathlib import Path
 
+from . import memo_context
 from . import persona_sections as ps
 from .local_llm import summarize_to_bullets
 
@@ -152,6 +153,16 @@ def ingest(
     changed, _ = ps.update_file("Recent Agent Context", "agent", res.lines, dry_run=dry_run)
     report["blocks"].append(
         {"section": "Recent Agent Context", "block_id": "agent", "lines": res.lines, "changed": changed}
+    )
+    lingo_lines = memo_context.derive_prompt_lingo_lines(prompts, "Agent prompt")
+    changed, _ = ps.update_optional_file("Persona", "agent_lingo", lingo_lines, dry_run=dry_run)
+    report["blocks"].append(
+        {
+            "section": "Persona",
+            "block_id": "agent_lingo",
+            "lines": lingo_lines,
+            "changed": changed,
+        }
     )
     report["status"] = "ok"
     report["engine"] = res.engine

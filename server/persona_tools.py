@@ -28,9 +28,12 @@ wrapper in ``bot-nemotron.py`` unwraps them automatically:
 
 from __future__ import annotations
 
+import datetime as dt
 import os
+import re
 from collections.abc import Callable
 from typing import Any
+from zoneinfo import ZoneInfo
 
 from loguru import logger
 from pipecat.services.llm_service import FunctionCallParams
@@ -38,13 +41,17 @@ from pipecat.services.llm_service import FunctionCallParams
 import actions
 import caller_snapshot as cs
 import contacts
+import google_calendar
 import persistence
 from interfaces import TOOL_REGISTRY, CallState
 
-# ─── P2 coordination seam ────────────────────────────────────────────────────
+# ─── Calendar read side ──────────────────────────────────────────────────────
 #
-# P2 owns the calendar read side. They can hook into our booking flow by
-# replacing this attribute at import time:
+# Defaults to the owner's connected Google Calendar (OAuth via the setup wizard).
+# When no calendar is connected, ``google_calendar.is_free`` returns None
+# ("unknown") and booking falls back to the outbox bridge — so this is always
+# safe. A teammate can still override the attribute at import time to plug a
+# different availability source:
 #
 #     import persona_tools
 #     persona_tools.calendar_free_busy_check = my_free_busy_check
@@ -52,7 +59,86 @@ from interfaces import TOOL_REGISTRY, CallState
 # Signature: ``(start_iso: str | None, end_iso: str | None) -> bool | None``
 # Return True if owner is free, False if busy, None if unknown.
 
-calendar_free_busy_check: Callable[[str | None, str | None], bool | None] | None = None
+calendar_free_busy_check: Callable[[str | None, str | None], bool | None] | None = (
+    google_calendar.is_free
+)
+
+_ADAPTATION_ROLE = "system"
+_ADAPTATION_PREFIX = "CALLER ADAPTATION:"
+
+
+def sync_voicemail_to_snapshot(call_state: Any) -> dict[str, Any]:
+    """Mirror P1's structured capture fields into P3's live caller snapshot.
+
+    P1's capture_* tools are the source of truth for the voicemail payload.
+    This helper keeps the richer P3 snapshot in lockstep so summaries, email,
+    persistence, and live adaptation all read one coherent per-call state.
+    """
+    snap: dict[str, Any] = call_state["caller_snapshot"]  # type: ignore[assignment]
+    voicemail = call_state.get("voicemail") or {}
+    msg = voicemail.get("message") or {}
+
+    urgency_map = {
+        "urgent": "high",
+        "high": "high",
+        "emergency": "emergency",
+        "normal": "normal",
+        "low": "low",
+        "can wait": "low",
+        "can_wait": "low",
+    }
+    raw_urgency = str(msg.get("urgency") or "").lower().strip()
+    urgency = urgency_map.get(raw_urgency) if raw_urgency else None
+
+    callback_preference: str | None = None
+    if "wants_callback" in msg:
+        if msg.get("wants_callback"):
+            callback_preference = "call back"
+            if msg.get("callback_number"):
+                callback_preference = f"call back at {msg['callback_number']}"
+        else:
+            callback_preference = "no callback requested"
+
+    cs.apply_snapshot_update(
+        snap,
+        caller_name=msg.get("caller_name"),
+        reason=msg.get("reason"),
+        urgency=urgency,
+        callback_preference=callback_preference,
+        best_time=msg.get("callback_preferred_time"),
+    )
+    cs.normalize_to_contract(snap)
+    return snap
+
+
+def refresh_live_style_directive(call_state: Any, context: Any) -> bool:
+    """Upsert the current caller-adaptation directive into an LLMContext.
+
+    Returns True when the context changed. The helper intentionally talks to
+    the tiny LLMContext surface used by Pipecat (get_messages/set_messages), so
+    it is easy to unit-test with a fake context.
+    """
+    directive = cs.live_style_directive(call_state)
+    messages = list(context.get_messages())
+
+    kept: list[Any] = []
+    previous: str | None = None
+    for message in messages:
+        if (
+            isinstance(message, dict)
+            and message.get("role") == _ADAPTATION_ROLE
+            and str(message.get("content") or "").startswith(_ADAPTATION_PREFIX)
+        ):
+            previous = str(message.get("content") or "")
+            continue
+        kept.append(message)
+
+    if previous == directive:
+        return False
+
+    kept.append({"role": _ADAPTATION_ROLE, "content": directive})
+    context.set_messages(kept)
+    return True
 
 
 # ─── Snapshot tools ──────────────────────────────────────────────────────────
@@ -117,24 +203,35 @@ async def lookup_persona(
     params: FunctionCallParams,
     call_state: CallState,
     caller_number: str | None = None,
+    caller_name: str | None = None,
 ) -> None:
     """Look up whether this caller is already known to the owner.
 
-    Use this once at the start of a call (with the caller's phone number, if
-    Twilio provided one) to set ``known_caller`` / ``persona_id`` on the
-    snapshot. If you don't have a number, you can skip this and the snapshot
-    will simply stay ``known_caller=false``.
+    Use this once at the start of a call. Real phone calls use Twilio's inbound
+    caller number. Browser/WebRTC demos have no caller ID, so after asking the
+    caller's name you may pass caller_name for an exact contact-book allowlist
+    check. Never claim that the browser name path is strong authentication.
 
     Args:
         caller_number: E.164 phone number, e.g. "+14155551234". Optional.
+        caller_name: Exact name stated by the caller. Browser/WebRTC fallback
+            only; ignored when an inbound phone number exists.
     """
     snap: dict[str, Any] = call_state["caller_snapshot"]  # type: ignore[assignment]
-    number = caller_number or call_state["voicemail"]["caller_number"] or ""
-
+    incoming_number = call_state["voicemail"]["caller_number"] or ""
+    number = incoming_number or caller_number or ""
+    verification_method = "incoming_phone" if incoming_number else None
     match = _persona_lookup(number)
+    if match and not verification_method:
+        verification_method = "stated_phone_demo"
+    if not match and not incoming_number and caller_name:
+        match = _persona_lookup_name(caller_name)
+        if match:
+            verification_method = "stated_name_demo"
     if match:
         snap["known_caller"] = True
         snap["persona_id"] = match["persona_id"]
+        snap["contact_verification"] = verification_method
         if match.get("relationship") and not snap.get("relationship"):
             snap["relationship"] = match["relationship"]
         # Pre-fill the caller's name from the contact book so the bot can greet
@@ -145,6 +242,7 @@ async def lookup_persona(
     else:
         snap["known_caller"] = False
         snap["persona_id"] = None
+        snap["contact_verification"] = None
     cs.normalize_to_contract(snap)
 
     await params.result_callback(
@@ -153,6 +251,8 @@ async def lookup_persona(
             "persona_id": snap["persona_id"],
             "caller_name": snap.get("caller_name"),
             "relationship": snap.get("relationship"),
+            "private_context_allowed": bool(match),
+            "verification_method": verification_method,
             "greeting_hint": (
                 f"This is {snap['caller_name']} from your contacts — greet them by name."
                 if match and snap.get("caller_name")
@@ -162,7 +262,7 @@ async def lookup_persona(
     )
 
 
-def greeting_for_caller(call_state: CallState) -> str | None:
+def greeting_for_caller(call_state: Any) -> str | None:
     """Recognise the inbound caller from the owner's contact book at call start.
 
     P1 calls this **once** in ``on_client_connected`` (Twilio path, where the
@@ -229,6 +329,157 @@ def _persona_lookup(number: str) -> dict[str, Any] | None:
     return None
 
 
+def _persona_lookup_name(name: str) -> dict[str, Any] | None:
+    """Resolve an exact contact name for the WebRTC demo fallback only."""
+    hit = contacts.lookup_name(name)
+    if not hit:
+        return None
+    return {
+        "persona_id": hit["name"],
+        "name": hit["name"],
+        "relationship": hit.get("relationship"),
+    }
+
+
+_BIRTHDAY_TOPIC = re.compile(
+    r"\b(birthday|bday|celebration|party|missed\s+my|couldn.?t\s+make)\b",
+    re.I,
+)
+_HACKATHON_REASON = re.compile(
+    r"(voice agent[^.\n]{0,40}hackathon|yc hackathon|hackathon project)",
+    re.I,
+)
+
+
+def _fallback_calendar_reason(
+    date_iso: str,
+    *,
+    caller_name: str | None = None,
+    topic: str | None = None,
+) -> dict[str, Any] | None:
+    """Derive one caller-facing reason from curated persona when live Calendar fails."""
+    from persona_context import load_persona_context
+
+    tz_name = (os.getenv("OWNER_TZ") or "America/Los_Angeles").strip()
+    today = dt.datetime.now(ZoneInfo(tz_name)).date().isoformat()
+    if date_iso != today:
+        return None
+
+    query = f"{caller_name or ''} {topic or ''}".strip()
+    if not query or not _BIRTHDAY_TOPIC.search(query):
+        return None
+
+    text = load_persona_context()
+    if not text:
+        return None
+
+    match = _HACKATHON_REASON.search(text)
+    if match:
+        reason = match.group(1).strip()
+    elif re.search(r"hackathon", text, re.I):
+        reason = "a hackathon project"
+    else:
+        return None
+
+    if len(reason) > 80:
+        reason = "a hackathon project"
+
+    return {
+        "date": date_iso,
+        "related_event_found": True,
+        "reason": reason,
+        "source": "persona_fallback",
+    }
+
+
+def _calendar_answer_hint(result: dict[str, Any]) -> str:
+    reason = result.get("reason")
+    if reason:
+        return (
+            f"Answer in first person: I couldn't make it because I was at {reason}. "
+            "Keep it brief and do not reveal any other calendar details."
+        )
+    return (
+        "Answer in first person that you are sorry, but do not invent a reason. "
+        "Offer to follow up."
+    )
+
+
+async def get_calendar_context_for_caller(
+    params: FunctionCallParams,
+    call_state: CallState,
+    date: str | None = None,
+    topic: str | None = None,
+) -> None:
+    """Answer a known contact's calendar-context question without exposing the calendar.
+
+    Call this only when a caller asks why the owner missed something or asks a
+    similar calendar-context question. The tool checks the per-call contact gate
+    itself. It returns at most one caller-facing reason, never the event list,
+    locations, attendees, descriptions, or exact schedule.
+
+    Args:
+        date: Local calendar date as YYYY-MM-DD. Defaults to today.
+        topic: What the caller asked about, e.g. "David Wu birthday".
+    """
+    snap: dict[str, Any] = call_state["caller_snapshot"]  # type: ignore[assignment]
+    if not snap.get("known_caller"):
+        await params.result_callback(
+            {
+                "authorized": False,
+                "answer_hint": (
+                    "Do not disclose calendar context. Ask for the caller's name and run "
+                    "lookup_persona, or offer to take a message."
+                ),
+            }
+        )
+        return
+
+    tz_name = (os.getenv("OWNER_TZ") or "America/Los_Angeles").strip()
+    query_date = date
+    if not query_date:
+        query_date = dt.datetime.now(ZoneInfo(tz_name)).date().isoformat()
+    result = google_calendar.explain_date_conflict(
+        query_date,
+        caller_name=str(snap.get("caller_name") or ""),
+        topic=topic,
+        timezone=tz_name,
+    )
+    if not result:
+        result = _fallback_calendar_reason(
+            query_date,
+            caller_name=str(snap.get("caller_name") or ""),
+            topic=topic,
+        )
+    if not result:
+        api_error = google_calendar._last_api_error
+        hint = "Say you are not sure and offer to take a message."
+        if api_error and "disabled" in api_error.lower():
+            hint = (
+                "Live calendar lookup is unavailable right now. Say you are not sure "
+                "what came up and offer to take a message."
+            )
+        await params.result_callback(
+            {
+                "authorized": True,
+                "context_available": False,
+                "answer_hint": hint,
+                "api_error": api_error,
+            }
+        )
+        return
+
+    await params.result_callback(
+        {
+            "authorized": True,
+            "context_available": True,
+            "related_event_found": result.get("related_event_found", False),
+            "answer_hint": _calendar_answer_hint(result),
+            "source": result.get("source", "google_calendar"),
+        }
+    )
+
+
 # ─── Action tools (Part B) ───────────────────────────────────────────────────
 #
 # We delegate to actions.make_action_tools() to keep all email/calendar logic in
@@ -286,6 +537,7 @@ async def book_callback_slot(
     tools = actions.make_action_tools(
         call_state,  # type: ignore[arg-type]
         free_busy_check=calendar_free_busy_check,
+        create_event=google_calendar.create_event,
     )
     book_fn = next(fn for fn in tools if fn.__name__ == "book_callback_slot")
     await book_fn(
@@ -363,7 +615,7 @@ def on_call_finished(call_state: CallState) -> str | None:
 # audio, so the privacy invariant holds.
 
 
-def observe_transcript_frame(call_state: CallState, frame: Any) -> str | None:
+def observe_transcript_frame(call_state: Any, frame: Any) -> str | None:
     """Fold one final caller transcript into the live snapshot's tone.
 
     Pure helper — no Pipecat import — so it is unit-testable with any object
@@ -379,13 +631,13 @@ def observe_transcript_frame(call_state: CallState, frame: Any) -> str | None:
     return tone
 
 
-def make_transcript_tone_processor(call_state: CallState) -> Any:
+def make_transcript_tone_processor(call_state: CallState, context: Any | None = None) -> Any:
     """Build a passthrough Pipecat ``FrameProcessor`` that auto-infers caller
     tone from final transcripts.
 
     Insert it in the pipeline between ``stt`` and the user aggregator::
 
-        tone_listener = persona_tools.make_transcript_tone_processor(call_state)
+        tone_listener = persona_tools.make_transcript_tone_processor(call_state, context)
         Pipeline([transport.input(), stt, tone_listener, user_aggregator, ...])
 
     Pipecat is imported lazily so this module stays importable in test
@@ -395,9 +647,10 @@ def make_transcript_tone_processor(call_state: CallState) -> Any:
     from pipecat.processors.frame_processor import FrameDirection, FrameProcessor
 
     class _TranscriptToneListener(FrameProcessor):
-        def __init__(self, state: CallState) -> None:
+        def __init__(self, state: CallState, llm_context: Any | None) -> None:
             super().__init__()
             self._state = state
+            self._context = llm_context
 
         async def process_frame(self, frame: Any, direction: FrameDirection) -> None:
             await super().process_frame(frame, direction)
@@ -407,11 +660,13 @@ def make_transcript_tone_processor(call_state: CallState) -> Any:
             ):
                 try:
                     observe_transcript_frame(self._state, frame)
+                    if self._context is not None:
+                        refresh_live_style_directive(self._state, self._context)
                 except Exception as exc:  # never break the audio pipeline
                     logger.warning(f"transcript tone listener skipped — {exc}")
             await self.push_frame(frame, direction)
 
-    return _TranscriptToneListener(call_state)
+    return _TranscriptToneListener(call_state, context)
 
 
 # ─── Registry append (runs at import time) ───────────────────────────────────
@@ -420,12 +675,13 @@ TOOL_REGISTRY.extend(
     [
         update_caller_snapshot,
         lookup_persona,
+        get_calendar_context_for_caller,
         send_owner_email,
         book_callback_slot,
     ]
 )
 
 logger.info(
-    "persona_tools loaded — registered 4 P3 tools; "
+    "persona_tools loaded — registered 5 P3 tools; "
     f"persistence backend={persistence.backend_kind()}"
 )

@@ -11,10 +11,24 @@ import sys
 import time
 from pathlib import Path
 
+import google_gmail
+import persona_context
+
 # Allow `from ingest ...` when pytest is run from server/.
 sys.path.insert(0, str(Path(__file__).resolve().parent.parent))
 
-from ingest import agent_context, gcal, imessage, local_llm  # noqa: E402
+from ingest import (  # noqa: E402
+    agent_context,
+    chatgpt_context,
+    codex_context,
+    discord,
+    gcal,
+    git_context,
+    gmail_context,
+    imessage,
+    local_llm,
+    refresh,
+)
 from ingest import persona_sections as ps  # noqa: E402
 
 # --- persona_sections ----------------------------------------------------
@@ -69,6 +83,16 @@ def test_update_file_dry_run_does_not_write(tmp_path: Path):
     assert changed is True
     assert "- free 4pm" in new
     assert f.read_text(encoding="utf-8") == _DOC  # unchanged on disk
+
+
+def test_update_optional_file_removes_stale_generated_block(tmp_path: Path):
+    f = tmp_path / "persona.md"
+    f.write_text(ps.apply_block(_DOC, "Current Priorities", "lingo", ["- stale"]), encoding="utf-8")
+    changed, new = ps.update_optional_file("Current Priorities", "lingo", [], path=f)
+    assert changed is True
+    assert "BEGIN:ingest:lingo" not in new
+    assert "- stale" not in new
+    assert "- curated baseline" in new
 
 
 # --- local_llm strict-local fallback -------------------------------------
@@ -200,6 +224,263 @@ def test_agent_context_parses_owner_prompts(tmp_path: Path):
 def test_agent_context_skips_when_root_missing(tmp_path: Path):
     rep = agent_context.ingest(root=tmp_path / "absent", dry_run=True)
     assert rep["status"] == "skipped"
+
+
+# --- Codex context parser (fixture DB) -----------------------------------
+
+
+def _make_codex_db(path: Path) -> None:
+    conn = sqlite3.connect(path)
+    conn.execute(
+        """
+        CREATE TABLE threads (
+            first_user_message TEXT NOT NULL,
+            updated_at INTEGER NOT NULL
+        )
+        """
+    )
+    conn.executemany(
+        "INSERT INTO threads (first_user_message, updated_at) VALUES (?, ?)",
+        [
+            ("delegate the implementation in parallel and verify tests", 2),
+            ("review this concise plan", 1),
+            ("", 3),
+        ],
+    )
+    conn.commit()
+    conn.close()
+
+
+def test_codex_context_parses_owner_prompts_without_raw_leak(tmp_path: Path):
+    db = tmp_path / "state.sqlite"
+    _make_codex_db(db)
+    prompts = codex_context.read_prompts(db)
+    assert len(prompts) == 2
+    facts, fallback = codex_context.memo_context.derive_prompt_facts(prompts)
+    assert "delegate" in facts and "verify" in facts
+    assert "implementation" not in facts
+    assert "implementation" not in " ".join(fallback)
+
+
+def test_codex_context_skips_when_db_missing(tmp_path: Path):
+    rep = codex_context.ingest(db_path=tmp_path / "absent.sqlite", dry_run=True)
+    assert rep["status"] == "skipped"
+
+
+# --- ChatGPT context parser (fixture JSON) -------------------------------
+
+
+def test_chatgpt_context_extracts_only_user_prompts(tmp_path: Path):
+    f = tmp_path / "conversation.json"
+    f.write_text(
+        json.dumps(
+            {
+                "mapping": {
+                    "1": {
+                        "message": {
+                            "author": {"role": "user"},
+                            "content": {"parts": ["delegate the private-sentinel build and verify tests"]},
+                        }
+                    },
+                    "2": {
+                        "message": {
+                            "author": {"role": "assistant"},
+                            "content": {"parts": ["assistant-only-sentinel"]},
+                        }
+                    },
+                }
+            }
+        ),
+        encoding="utf-8",
+    )
+    prompts, decoded = chatgpt_context.read_prompts(tmp_path)
+    assert decoded == 1
+    assert prompts == ["delegate the private-sentinel build and verify tests"]
+    facts, fallback = chatgpt_context.memo_context.derive_prompt_facts(prompts)
+    rendered = facts + " ".join(fallback)
+    assert "delegate" in rendered and "verify" in rendered
+    assert "private-sentinel" not in rendered
+    assert "assistant-only-sentinel" not in rendered
+
+
+def test_chatgpt_context_skips_missing_or_binary_store(tmp_path: Path):
+    missing = chatgpt_context.ingest(root=tmp_path / "absent", dry_run=True)
+    assert missing["status"] == "skipped"
+
+    binary = tmp_path / "conversation.data"
+    binary.write_bytes(b"\xff\x00\xfeopaque")
+    rep = chatgpt_context.ingest(root=tmp_path, dry_run=True)
+    assert rep["status"] == "skipped"
+    assert "unsupported binary format" in rep["reason"]
+
+
+# --- local Git context parser --------------------------------------------
+
+
+def test_git_context_derives_categories_without_raw_messages():
+    facts, fallback = git_context._derive_facts(
+        {
+            "commits": ["fix secret-project-name latency", "Merge branch 'secret-work'"],
+            "reflog": ["commit: fix secret-project-name latency", "pull: Fast-forward"],
+            "branches": ["main", "secret-work"],
+        }
+    )
+    rendered = facts + " ".join(fallback)
+    assert "fix=1" in rendered and "merge=1" in rendered
+    assert "commit=1" in rendered and "pull=1" in rendered
+    assert "secret" not in rendered
+
+
+def test_git_context_skips_when_repo_missing(tmp_path: Path):
+    rep = git_context.ingest(repo=tmp_path / "absent", dry_run=True)
+    assert rep["status"] == "skipped"
+
+
+def test_refresh_accepts_new_memo_sources(monkeypatch):
+    seen = []
+
+    def fake(name, days, dry_run, discord_path):
+        seen.append(name)
+        return {"source": name, "status": "ok", "blocks": []}
+
+    monkeypatch.setattr(refresh, "_run_source", fake)
+    assert refresh.main(["--sources", "gmail,agent,codex,chatgpt,git", "--dry-run"]) == 0
+    assert seen == ["gmail", "agent", "codex", "chatgpt", "git"]
+
+
+def test_refresh_uploads_cleaned_cloud_persona(monkeypatch):
+    monkeypatch.setattr(
+        refresh,
+        "_run_source",
+        lambda name, days, dry_run, discord_path: {
+            "source": name,
+            "status": "ok",
+            "blocks": [],
+        },
+    )
+    uploaded = []
+    monkeypatch.setattr(
+        persona_context,
+        "upload_persona_context",
+        lambda: uploaded.append(True) or "dynamodb:test/persona",
+    )
+
+    assert refresh.main(["--sources", "git"]) == 0
+    assert uploaded == [True]
+
+
+# --- Gmail sent-mail style -----------------------------------------------
+
+
+def test_gmail_style_facts_never_include_raw_email_text():
+    secret = "private-sentinel-project"
+    facts, fallback = gmail_context._style_facts(
+        [
+            f"Hi team,\n\nQuick update on {secret}. Can you review?\n\nThanks,\nMe",
+            "Sharing the status now.\n\nBest,\nMe",
+        ]
+    )
+    rendered = "\n".join(facts + fallback)
+    assert "sent emails sampled: 2" in rendered
+    assert secret not in rendered
+    assert fallback
+
+
+def test_gmail_strips_quoted_reply():
+    body = "My fresh answer.\n\nOn Sat, May 30, 2026 wrote:\n> private quoted history"
+    assert google_gmail._strip_quoted_reply(body) == "My fresh answer."
+
+
+def test_gmail_context_skips_without_connection(monkeypatch):
+    monkeypatch.setattr(gmail_context.google_gmail, "is_connected", lambda: False)
+    rep = gmail_context.ingest(dry_run=True)
+    assert rep["status"] == "skipped"
+    assert "reconnect Gmail" in rep["reason"]
+
+
+# --- Discord export parser (DiscordChatExporter + official) --------------
+
+
+def _write_dce_export(path: Path) -> None:
+    """A DiscordChatExporter-shape JSON: owner 'me' + one inbound contact."""
+    now = time.gmtime()
+    ts = time.strftime("%Y-%m-%dT%H:%M:%S+00:00", now)
+    obj = {
+        "channel": {"name": "dms"},
+        "messages": [
+            {"timestamp": ts, "content": "lol yeah deploying the bot rn fr",
+             "author": {"id": "1", "name": "me"}},
+            {"timestamp": ts, "content": "ngl the latency looks good",
+             "author": {"id": "1", "name": "me"}},
+            {"timestamp": ts, "content": "can you review the deploy pipeline",
+             "author": {"id": "2", "name": "teammate"}},
+            {"timestamp": ts, "content": "",  # attachment-only -> dropped
+             "author": {"id": "2", "name": "teammate"}},
+        ],
+    }
+    path.write_text(json.dumps(obj), encoding="utf-8")
+
+
+def test_discord_dce_separates_owner_voice(tmp_path: Path):
+    f = tmp_path / "discord_export.json"
+    _write_dce_export(f)
+    msgs = discord.load_export(f, owner="1")
+    assert len(msgs) == 3  # empty-content message dropped
+    outbound = [m for m in msgs if m.is_from_me]
+    assert len(outbound) == 2  # both 'me' messages
+    assert all(not m.is_from_me for m in msgs if m.author_id == "2")
+
+    facts, fallback = discord._style_facts(outbound)
+    assert any("lol" in line or "fr" in line or "ngl" in line for line in facts)
+    assert fallback  # non-empty deterministic voice bullets
+
+
+def test_discord_owner_match_by_username(tmp_path: Path):
+    f = tmp_path / "discord_export.json"
+    _write_dce_export(f)
+    # Owner given as a username (case-insensitive) instead of id.
+    msgs = discord.load_export(f, owner="ME")
+    assert sum(m.is_from_me for m in msgs) == 2
+
+
+def test_discord_deidentifies_contacts():
+    # Username never appears; stable hashed token; alias wins when provided.
+    label = discord._display_author("2", "teammate", {})
+    assert label.startswith("user …")
+    assert "teammate" not in label
+    assert label == discord._display_author("2", "teammate", {})  # stable
+    assert discord._display_author("2", "teammate", {"2": "Dana"}) == "Dana"
+    assert discord._display_author("2", "teammate", {"teammate": "Dana"}) == "Dana"
+
+
+def test_discord_official_csv_is_all_outbound(tmp_path: Path):
+    f = tmp_path / "messages.csv"
+    ts = time.strftime("%Y-%m-%dT%H:%M:%S+00:00", time.gmtime())
+    f.write_text(
+        "ID,Timestamp,Contents,Attachments\n"
+        f"1,{ts},shipping the eval loop today,\n"
+        f"2,{ts},,\n",  # empty contents -> dropped
+        encoding="utf-8",
+    )
+    msgs = discord.load_export(f)
+    assert len(msgs) == 1
+    assert msgs[0].is_from_me is True  # official export is owner-only
+
+
+def test_discord_skips_when_export_missing(tmp_path: Path):
+    rep = discord.ingest(export_path=tmp_path / "nope.json", dry_run=True)
+    assert rep["status"] == "skipped"
+    assert "no export" in rep["reason"]
+
+
+def test_discord_no_owner_means_no_outbound(tmp_path: Path):
+    # Without an owner, nothing is flagged outbound -> the Persona voice block is
+    # skipped (ingest emits a 'voice_skipped' note) while topics/people still derive.
+    f = tmp_path / "discord_export.json"
+    _write_dce_export(f)
+    msgs = discord.load_export(f, owner=None)
+    assert msgs and not any(m.is_from_me for m in msgs)
+    assert discord._style_facts([]) == ([], [])  # no outbound -> empty voice facts
 
 
 # --- calendar graceful skip ----------------------------------------------

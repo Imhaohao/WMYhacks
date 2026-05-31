@@ -311,8 +311,9 @@ def test_make_action_tools_returns_two_callables(action_state):
     assert all(callable(t) for t in tools)
 
 
-def test_send_owner_email_queued(action_state):
+def test_send_owner_email_queued(action_state, monkeypatch):
     state, outbox = action_state
+    monkeypatch.delenv("RESEND_API_KEY", raising=False)
     send_fn, _ = actions.make_action_tools(state)
     fp = FakeParams()
     asyncio.run(send_fn(fp))
@@ -347,6 +348,63 @@ def test_book_callback_busy_needs_reschedule(action_state):
     assert fp.last["status"] == "needs_reschedule"
 
 
+def test_book_callback_resolves_before_today(action_state, monkeypatch):
+    state, _ = action_state
+    monkeypatch.setenv("OWNER_TZ", "America/Los_Angeles")
+    state["voicemail"] = {
+        "recorded_at": "2026-05-30T20:00:00+00:00",
+        "message": {"caller_name": "Sam"},
+    }
+    _, book_fn = actions.make_action_tools(state)
+    fp = FakeParams()
+    asyncio.run(book_fn(fp, requested_time="before 4pm today"))
+
+    event = state["actions"][0]
+    assert event["start_iso"].startswith("2026-05-30T15:30:00")
+    assert event["end_iso"].startswith("2026-05-30T16:00:00")
+
+
+def test_book_callback_resolves_tomorrow_morning(action_state, monkeypatch):
+    state, _ = action_state
+    monkeypatch.setenv("OWNER_TZ", "America/Los_Angeles")
+    state["voicemail"] = {
+        "recorded_at": "2026-05-30T20:00:00+00:00",
+        "message": {"caller_name": "Sam"},
+    }
+    _, book_fn = actions.make_action_tools(state)
+    fp = FakeParams()
+    asyncio.run(book_fn(fp, requested_time="tomorrow morning"))
+
+    event = state["actions"][0]
+    assert event["start_iso"].startswith("2026-05-31T09:00:00")
+    assert event["end_iso"].startswith("2026-05-31T09:30:00")
+
+
+def test_book_callback_free_busy_sees_resolved_time(action_state, monkeypatch):
+    state, _ = action_state
+    monkeypatch.setenv("OWNER_TZ", "America/Los_Angeles")
+    state["voicemail"] = {
+        "recorded_at": "2026-05-30T20:00:00+00:00",
+        "message": {"caller_name": "Sam"},
+    }
+    seen: dict[str, str | None] = {}
+
+    def free_busy(start, end):
+        seen["start"] = start
+        seen["end"] = end
+        return True
+
+    _, book_fn = actions.make_action_tools(state, free_busy_check=free_busy)
+    fp = FakeParams()
+    asyncio.run(book_fn(fp, requested_time="after 3pm today"))
+
+    assert seen["start"] is not None
+    assert seen["end"] is not None
+    assert seen["start"].startswith("2026-05-30T15:00:00")
+    assert seen["end"].startswith("2026-05-30T15:30:00")
+    assert fp.last["status"] == "queued"
+
+
 def test_tools_do_not_raise_on_minimal_state(tmp_path, monkeypatch):
     outbox = tmp_path / "min_actions.jsonl"
     monkeypatch.setenv("PERSIST_OUTBOX_PATH", str(outbox))
@@ -358,6 +416,24 @@ def test_tools_do_not_raise_on_minimal_state(tmp_path, monkeypatch):
     asyncio.run(send_fn(fp))
     asyncio.run(book_fn(fp))
     # No exception raised — that's the assertion
+
+
+def test_build_summary_text_reads_nested_voicemail_message(action_state):
+    state, _ = action_state
+    state["voicemail"] = {
+        "message": {
+            "caller_name": "Mina",
+            "reason": "delivery timing",
+            "urgency": "urgent",
+            "callback_preferred_time": "before 4pm today",
+        }
+    }
+    state["caller_snapshot"]["caller_name"] = "Mina"
+    summary = actions.build_summary_text(state)
+    assert "Caller Name: Mina" in summary
+    assert "Reason: delivery timing" in summary
+    assert "Callback Preferred Time: before 4pm today" in summary
+    assert "Caller snapshot:" in summary
 
 
 # ===========================================================================
@@ -390,6 +466,69 @@ def test_observe_transcript_frame_ignores_blank():
     state: dict[str, Any] = {"caller_snapshot": caller_snapshot.fresh_snapshot()}
     assert persona_tools.observe_transcript_frame(state, _FakeFrame("   ")) is None
     assert persona_tools.observe_transcript_frame(state, _FakeFrame("")) is None
+
+
+def test_sync_voicemail_to_snapshot_mirrors_p1_captures():
+    import persona_tools
+
+    state: dict[str, Any] = {
+        "voicemail": {
+            "message": {
+                "caller_name": "Ana",
+                "reason": "needs bouquet changed",
+                "urgency": "urgent",
+                "wants_callback": True,
+                "callback_number": "+14155550123",
+                "callback_preferred_time": "before 4pm today",
+            }
+        },
+        "caller_snapshot": caller_snapshot.fresh_snapshot(),
+    }
+
+    snap = persona_tools.sync_voicemail_to_snapshot(state)
+
+    assert snap["caller_name"] == "Ana"
+    assert snap["reason"] == "needs bouquet changed"
+    assert snap["urgency"] == "high"
+    assert snap["best_time"] == "before 4pm today"
+    assert snap["callback_preference"] == "call back at +14155550123"
+    assert snap["intent"] == "urgent_callback"
+
+
+class _FakeContext:
+    def __init__(self) -> None:
+        self._messages: list[dict[str, str]] = []
+
+    def get_messages(self) -> list[dict[str, str]]:
+        return list(self._messages)
+
+    def set_messages(self, messages: list[dict[str, str]]) -> None:
+        self._messages = list(messages)
+
+
+def test_refresh_live_style_directive_upserts_one_system_message():
+    import persona_tools
+
+    state: dict[str, Any] = {"caller_snapshot": caller_snapshot.fresh_snapshot()}
+    context = _FakeContext()
+
+    assert persona_tools.refresh_live_style_directive(state, context) is True
+    assert len(context.get_messages()) == 1
+
+    caller_snapshot.observe_caller_tone(
+        state["caller_snapshot"],
+        "I'm in a hurry, gotta go before 4",
+    )
+    caller_snapshot.normalize_to_contract(state["caller_snapshot"])
+
+    assert persona_tools.refresh_live_style_directive(state, context) is True
+    messages = context.get_messages()
+    assert len(messages) == 1
+    assert messages[0]["role"] == "system"
+    assert "rushed" in messages[0]["content"].lower()
+
+    assert persona_tools.refresh_live_style_directive(state, context) is False
+    assert len(context.get_messages()) == 1
 
 
 # ===========================================================================
@@ -428,14 +567,18 @@ class TestParseVcards:
 
     def test_parses_name_and_number(self):
         idx = contacts.parse_vcards(self.SAMPLE)
-        hit = idx[contacts.normalize_number("+14155550142")]
+        key = contacts.normalize_number("+14155550142")
+        assert key is not None
+        hit = idx[key]
         assert hit["name"] == "Sam Rivera"
         assert hit["relationship"] == "Work"
         assert hit["source"] == "vcard"
 
     def test_category_optional(self):
         idx = contacts.parse_vcards(self.SAMPLE)
-        hit = idx[contacts.normalize_number("4155550168")]
+        key = contacts.normalize_number("4155550168")
+        assert key is not None
+        hit = idx[key]
         assert hit["name"] == "Mom"
         assert hit["relationship"] is None
 
@@ -445,8 +588,10 @@ class TestParseVcards:
 
 class TestLookup:
     def test_lookup_hits_indexed_number(self, monkeypatch):
+        key = contacts.normalize_number("+14155550142")
+        assert key is not None
         idx = {
-            contacts.normalize_number("+14155550142"): {
+            key: {
                 "name": "Sam Rivera",
                 "relationship": "Work",
                 "source": "vcard",
@@ -461,6 +606,21 @@ class TestLookup:
         monkeypatch.setattr(contacts, "_INDEX", {})
         assert contacts.lookup("+14155550100") is None
         assert contacts.lookup("") is None
+
+    def test_lookup_name_requires_exact_unique_contact(self, monkeypatch):
+        monkeypatch.setattr(
+            contacts,
+            "_NAME_INDEX",
+            {
+                "david wu": {
+                    "name": "David Wu",
+                    "relationship": "Friend",
+                    "source": "vcard",
+                }
+            },
+        )
+        assert contacts.lookup_name("david wu")["name"] == "David Wu"
+        assert contacts.lookup_name("David") is None
 
 
 class TestPersonaLookupWiring:
@@ -495,7 +655,7 @@ class TestPersonaLookupWiring:
 
 
 class TestGreetingForCaller:
-    def _state(self, number):
+    def _state(self, number: str) -> dict[str, Any]:
         return {
             "voicemail": {"caller_number": number},
             "caller_snapshot": caller_snapshot.fresh_snapshot(),
@@ -531,3 +691,127 @@ class TestGreetingForCaller:
         monkeypatch.delenv("OWNER_PHONE_NUMBER", raising=False)
         state = self._state("")
         assert persona_tools.greeting_for_caller(state) is None
+
+
+# ===========================================================================
+# 6. Contact-gated calendar context
+# ===========================================================================
+
+
+def test_lookup_persona_allows_exact_name_for_webrtc_demo(monkeypatch):
+    import persona_tools
+
+    monkeypatch.setattr(
+        contacts,
+        "lookup_name",
+        lambda name: {"name": "David Wu", "relationship": "Friend", "source": "vcard"}
+        if name == "David Wu"
+        else None,
+    )
+    state: dict[str, Any] = {
+        "voicemail": {"caller_number": ""},
+        "caller_snapshot": caller_snapshot.fresh_snapshot(),
+    }
+    fp = FakeParams()
+    asyncio.run(persona_tools.lookup_persona(fp, state, caller_name="David Wu"))
+
+    assert fp.last["private_context_allowed"] is True
+    assert fp.last["verification_method"] == "stated_name_demo"
+    assert state["caller_snapshot"]["known_caller"] is True
+    assert state["caller_snapshot"]["caller_name"] == "David Wu"
+
+
+def test_calendar_context_refuses_unknown_caller(monkeypatch):
+    import persona_tools
+
+    called = {"calendar": False}
+    monkeypatch.setattr(
+        persona_tools.google_calendar,
+        "explain_date_conflict",
+        lambda *_a, **_k: called.__setitem__("calendar", True),
+    )
+    state: dict[str, Any] = {
+        "caller_snapshot": caller_snapshot.fresh_snapshot(),
+    }
+    fp = FakeParams()
+    asyncio.run(
+        persona_tools.get_calendar_context_for_caller(
+            fp,
+            state,
+            date="2026-05-30",
+            topic="David Wu birthday",
+        )
+    )
+
+    assert fp.last["authorized"] is False
+    assert called["calendar"] is False
+
+
+def test_calendar_context_falls_back_to_persona_when_live_calendar_unavailable(monkeypatch):
+    import persona_tools
+
+    monkeypatch.setattr(
+        persona_tools.google_calendar,
+        "explain_date_conflict",
+        lambda *_a, **_k: None,
+    )
+    monkeypatch.setattr(
+        persona_tools,
+        "_fallback_calendar_reason",
+        lambda *_a, **_k: {
+            "date": "2026-05-30",
+            "related_event_found": True,
+            "reason": "a hackathon project",
+            "source": "persona_fallback",
+        },
+    )
+    snap = caller_snapshot.fresh_snapshot()
+    snap["known_caller"] = True
+    snap["caller_name"] = "David Wu"
+    state: dict[str, Any] = {"caller_snapshot": snap}
+    fp = FakeParams()
+    asyncio.run(
+        persona_tools.get_calendar_context_for_caller(
+            fp,
+            state,
+            date="2026-05-30",
+            topic="my birthday",
+        )
+    )
+
+    assert fp.last["authorized"] is True
+    assert fp.last["context_available"] is True
+    assert fp.last["source"] == "persona_fallback"
+    assert "hackathon project" in fp.last["answer_hint"]
+
+
+def test_calendar_context_returns_one_first_person_reason_for_known_contact(monkeypatch):
+    import persona_tools
+
+    monkeypatch.setattr(
+        persona_tools.google_calendar,
+        "explain_date_conflict",
+        lambda *_a, **_k: {
+            "date": "2026-05-30",
+            "related_event_found": True,
+            "reason": "Voice Agent YC Hackathon",
+        },
+    )
+    snap = caller_snapshot.fresh_snapshot()
+    snap["known_caller"] = True
+    snap["caller_name"] = "David Wu"
+    state: dict[str, Any] = {"caller_snapshot": snap}
+    fp = FakeParams()
+    asyncio.run(
+        persona_tools.get_calendar_context_for_caller(
+            fp,
+            state,
+            date="2026-05-30",
+            topic="my birthday",
+        )
+    )
+
+    assert fp.last["authorized"] is True
+    assert fp.last["related_event_found"] is True
+    assert "I couldn't make it because I was at Voice Agent YC Hackathon" in fp.last["answer_hint"]
+    assert "David Wu" not in fp.last["answer_hint"]

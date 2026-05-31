@@ -27,6 +27,7 @@ from pathlib import Path
 
 from . import persona_sections as ps
 from .local_llm import summarize_to_bullets
+from .voice_lingo import derive_lingo, render_lingo_lines
 
 DEFAULT_DB = Path.home() / "Library" / "Messages" / "chat.db"
 ALIASES_PATH = Path(__file__).resolve().parent.parent / "ingest_contacts.json"
@@ -199,6 +200,10 @@ def ingest(
     aliases = _load_aliases()
     contact_facts, contact_fallback = _contact_facts(rows, aliases, top_contacts)
     topic_facts, topic_fallback = _topic_facts(rows, top_topics)
+    lingo_lines = render_lingo_lines(
+        derive_lingo([r["text"] for r in rows if r["is_from_me"] and r["text"]]),
+        "Message",
+    )
 
     # People Rules: who is active and likely expecting a callback.
     people = summarize_to_bullets(
@@ -233,6 +238,15 @@ def ingest(
         report["blocks"].append(
             {"section": section, "block_id": block_id, "lines": res.lines, "changed": changed}
         )
+    changed, _ = ps.update_optional_file("Persona", "imessage_lingo", lingo_lines, dry_run=dry_run)
+    report["blocks"].append(
+        {
+            "section": "Persona",
+            "block_id": "imessage_lingo",
+            "lines": lingo_lines,
+            "changed": changed,
+        }
+    )
 
     report["status"] = "ok"
     report["engine"] = engine

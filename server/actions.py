@@ -40,6 +40,7 @@ from __future__ import annotations
 
 import json
 import os
+import re
 import smtplib
 import uuid
 from collections.abc import Callable
@@ -47,6 +48,9 @@ from datetime import UTC, datetime, timedelta
 from email.message import EmailMessage
 from pathlib import Path
 from typing import Any
+from urllib import error as urllib_error
+from urllib import request as urllib_request
+from zoneinfo import ZoneInfo, ZoneInfoNotFoundError
 
 from loguru import logger
 
@@ -57,7 +61,18 @@ DEFAULT_OWNER_EMAIL = "imzihaoi@gmail.com"
 
 
 def owner_email() -> str:
-    return os.getenv("OWNER_EMAIL", DEFAULT_OWNER_EMAIL)
+    env_email = os.getenv("OWNER_EMAIL", "").strip()
+    if env_email:
+        return env_email
+    try:
+        import owner_config
+
+        cfg_email = str(owner_config.load_owner_config().get("owner_email") or "").strip()
+        if cfg_email:
+            return cfg_email
+    except Exception:
+        pass
+    return DEFAULT_OWNER_EMAIL
 
 
 def _outbox_path() -> Path:
@@ -94,10 +109,19 @@ def build_summary_text(call_state: dict[str, Any]) -> str:
     lines: list[str] = ["New voicemail for you:", ""]
 
     vm = call_state.get("voicemail") or {}
+    msg_candidate = vm.get("message")
+    msg = msg_candidate if isinstance(msg_candidate, dict) else vm
     # P1's structured fields — render whatever is present, in a stable order.
-    for key in ("caller_name", "reason", "urgency", "callback_number", "callback_preference",
-                "best_time", "message"):
-        val = vm.get(key)
+    for key in (
+        "caller_name",
+        "reason",
+        "urgency",
+        "callback_number",
+        "callback_preference",
+        "callback_preferred_time",
+        "best_time",
+    ):
+        val = msg.get(key)
         if val:
             lines.append(f"  {key.replace('_', ' ').title()}: {val}")
 
@@ -141,20 +165,268 @@ def _send_via_smtp(to_addr: str, subject: str, body: str) -> bool:
         return False
 
 
+def _send_via_gmail_oauth(to_addr: str, subject: str, body: str) -> dict[str, Any] | None:
+    """Send through the owner's connected Gmail OAuth account, if available."""
+    try:
+        import google_gmail
+
+        sender = os.getenv("GMAIL_SENDER", to_addr).strip() or to_addr
+        return google_gmail.send_email(to_addr, subject, body, sender=sender)
+    except Exception as e:
+        logger.warning(f"actions: Gmail OAuth send failed ({type(e).__name__}); will fall back")
+        return None
+
+
+def _send_via_resend(to_addr: str, subject: str, body: str) -> bool:
+    """Send through Resend's HTTPS API. Returns True on success."""
+    api_key = os.getenv("RESEND_API_KEY", "").strip()
+    if not api_key:
+        return False
+    from_addr = os.getenv("EMAIL_FROM", "onboarding@resend.dev").strip()
+    payload = json.dumps(
+        {"from": from_addr, "to": [to_addr], "subject": subject, "text": body}
+    ).encode("utf-8")
+    req = urllib_request.Request(
+        "https://api.resend.com/emails",
+        data=payload,
+        headers={
+            "Authorization": f"Bearer {api_key}",
+            "Content-Type": "application/json",
+        },
+        method="POST",
+    )
+    try:
+        with urllib_request.urlopen(req, timeout=15) as resp:
+            return 200 <= resp.status < 300
+    except urllib_error.HTTPError as exc:
+        detail = exc.read().decode("utf-8", errors="ignore")[:200]
+        logger.warning(f"actions: Resend send failed ({exc.code}): {detail}")
+        return False
+    except Exception as exc:
+        logger.warning(f"actions: Resend send failed ({type(exc).__name__})")
+        return False
+
+
+def _voicemail_message(call_state: dict[str, Any]) -> dict[str, Any]:
+    """Return the structured capture dict, whether nested or flat on voicemail."""
+    vm = call_state.get("voicemail") or {}
+    msg = vm.get("message")
+    if isinstance(msg, dict):
+        return msg
+    return vm if isinstance(vm, dict) else {}
+
+
+def _hydrate_message_from_snapshot(call_state: dict[str, Any]) -> dict[str, Any]:
+    """Copy snapshot fields into voicemail.message when P1 capture_* was skipped."""
+    vm = call_state.setdefault("voicemail", {})
+    if not isinstance(vm.get("message"), dict):
+        vm["message"] = {
+            k: v
+            for k, v in vm.items()
+            if k not in ("message", "summary", "transcript", "email_sent", "sms_sent", "action_items", "callback_slot", "caller_number", "duration_seconds", "recorded_at")
+            and v not in (None, "", [], {})
+        }
+    msg = vm.setdefault("message", {})
+    snap = call_state.get("caller_snapshot") or {}
+    for key in ("caller_name", "reason"):
+        if not msg.get(key) and snap.get(key):
+            msg[key] = snap[key]
+    if not msg.get("urgency") and snap.get("urgency"):
+        msg["urgency"] = snap["urgency"]
+    return msg
+
+
+def _has_email_content(call_state: dict[str, Any]) -> bool:
+    msg = _hydrate_message_from_snapshot(call_state)
+    flat = _voicemail_message(call_state)
+    snap = call_state.get("caller_snapshot") or {}
+    return bool(
+        msg.get("reason")
+        or msg.get("caller_name")
+        or flat.get("reason")
+        or flat.get("caller_name")
+        or snap.get("reason")
+        or snap.get("caller_name")
+    )
+
+
+def deliver_owner_email(
+    call_state: dict[str, Any],
+    subject: str | None = None,
+) -> dict[str, Any]:
+    """Best-effort owner email: Gmail OAuth → SMTP → Resend → outbox queue.
+
+    Idempotent per call via ``voicemail.email_sent``. Safe to call from
+    ``finish_voicemail``, the ``send_owner_email`` tool, or the disconnect
+    fallback when the LLM ends the call without firing those tools.
+    """
+    vm = call_state.setdefault("voicemail", {})
+    if vm.get("email_sent"):
+        return {"status": "already_sent", "to": owner_email()}
+
+    if not _has_email_content(call_state):
+        return {"status": "skipped", "reason": "no caller content captured"}
+
+    msg = vm.get("message") or {}
+    flat = _voicemail_message(call_state)
+    snap = call_state.get("caller_snapshot") or {}
+    who = msg.get("caller_name") or flat.get("caller_name") or snap.get("caller_name") or "a caller"
+    why = msg.get("reason") or flat.get("reason") or snap.get("reason") or "a message"
+    subj = subject or f"Voicemail from {who} — {why}"
+    body = (vm.get("summary") or "").strip() or build_summary_text(call_state)
+    to_addr = owner_email()
+
+    gmail_sent = _send_via_gmail_oauth(to_addr, subj, body)
+    sent_by = "google_gmail" if gmail_sent else None
+    sent = bool(gmail_sent)
+    if not sent:
+        sent = _send_via_smtp(to_addr, subj, body)
+        sent_by = "smtp" if sent else sent_by
+    if not sent:
+        sent = _send_via_resend(to_addr, subj, body)
+        sent_by = "resend" if sent else sent_by
+
+    action: dict[str, Any] = {
+        "action_id": uuid.uuid4().hex,
+        "type": "email",
+        "channel": "gmail",
+        "to": to_addr,
+        "subject": subj,
+        "body": body,
+        "status": "sent" if sent else "queued",
+        "fulfilled_by": sent_by or "bridge",
+        "timestamp": _now_iso(),
+    }
+    if gmail_sent:
+        action["gmail_message_id"] = gmail_sent.get("id")
+        action["gmail_thread_id"] = gmail_sent.get("threadId")
+    if not sent:
+        action["outbox"] = _append_outbox({"action": "send_email", **action})
+    _record_action(call_state, action)
+    if sent:
+        vm["email_sent"] = True
+    logger.info(f"deliver_owner_email -> {to_addr} status={action['status']}")
+    return action
+
+
 # --- Calendar helpers -------------------------------------------------------
 
+def _owner_timezone() -> ZoneInfo:
+    try:
+        tz = os.getenv("OWNER_TZ", "").strip()
+        if not tz:
+            try:
+                import owner_config
+
+                tz = str(owner_config.load_owner_config().get("timezone") or "").strip()
+            except Exception:
+                tz = ""
+        return ZoneInfo(tz or "America/Los_Angeles")
+    except ZoneInfoNotFoundError:
+        logger.warning("actions: invalid OWNER_TZ; falling back to UTC")
+        return ZoneInfo("UTC")
+
+
+def _call_base_time(call_state: dict[str, Any], tz: ZoneInfo) -> datetime:
+    recorded_at = (call_state.get("voicemail") or {}).get("recorded_at")
+    if recorded_at:
+        try:
+            parsed = datetime.fromisoformat(str(recorded_at).replace("Z", "+00:00"))
+            if parsed.tzinfo is None:
+                parsed = parsed.replace(tzinfo=UTC)
+            return parsed.astimezone(tz)
+        except ValueError:
+            pass
+    return datetime.now(tz)
+
+
+def _parse_clock(text: str) -> tuple[str, int, int] | None:
+    match = re.search(
+        r"\b(?:(before|by|after|around|at)\s+)?(\d{1,2})(?::(\d{2}))?\s*(am|pm)?\b",
+        text,
+    )
+    if not match:
+        return None
+    relation = match.group(1) or "at"
+    hour = int(match.group(2))
+    minute = int(match.group(3) or "0")
+    meridiem = match.group(4)
+    if meridiem == "pm" and hour != 12:
+        hour += 12
+    elif meridiem == "am" and hour == 12:
+        hour = 0
+    elif meridiem is None and 1 <= hour <= 7:
+        # Callback windows without am/pm are usually business-hour afternoons.
+        hour += 12
+    if hour > 23 or minute > 59:
+        return None
+    return relation, hour, minute
+
+
+def _resolve_requested_time(
+    requested_time: str | None,
+    call_state: dict[str, Any],
+) -> tuple[str | None, str | None]:
+    if not requested_time:
+        return None, None
+
+    text = requested_time.lower().strip()
+    tz = _owner_timezone()
+    base = _call_base_time(call_state, tz)
+    day = base.date()
+    explicit_today = "today" in text
+
+    if "tomorrow" in text:
+        day = day + timedelta(days=1)
+
+    clock = _parse_clock(text)
+    if clock:
+        relation, hour, minute = clock
+        anchor = datetime.combine(day, datetime.min.time(), tzinfo=tz).replace(
+            hour=hour,
+            minute=minute,
+        )
+        if relation in {"before", "by"}:
+            start = anchor - timedelta(minutes=30)
+            end = anchor
+        else:
+            start = anchor
+            end = anchor + timedelta(minutes=30)
+    elif "morning" in text:
+        start = datetime.combine(day, datetime.min.time(), tzinfo=tz).replace(hour=9)
+        end = start + timedelta(minutes=30)
+    elif "afternoon" in text:
+        start = datetime.combine(day, datetime.min.time(), tzinfo=tz).replace(hour=13)
+        end = start + timedelta(minutes=30)
+    elif "evening" in text:
+        start = datetime.combine(day, datetime.min.time(), tzinfo=tz).replace(hour=17)
+        end = start + timedelta(minutes=30)
+    else:
+        return None, None
+
+    if start <= base and "tomorrow" not in text and not explicit_today:
+        start += timedelta(days=1)
+        end += timedelta(days=1)
+    return start.isoformat(), end.isoformat()
+
+
 def _resolve_slot(
-    start_iso: str | None, end_iso: str | None, requested_time: str | None
+    start_iso: str | None,
+    end_iso: str | None,
+    requested_time: str | None,
+    call_state: dict[str, Any],
 ) -> tuple[str | None, str | None]:
     """Best-effort: if a start is given without an end, default to a 30-minute
-    slot. We do NOT hard-parse vague phrases ("before 4pm") here — those ride
-    along as ``requested_time`` for the owner/bridge to confirm."""
+    slot. If only a simple requested_time phrase is present, resolve common demo
+    windows like "before 4pm today" and "tomorrow morning" in OWNER_TZ."""
     if start_iso and not end_iso:
         try:
             start = datetime.fromisoformat(start_iso.replace("Z", "+00:00"))
             end_iso = (start + timedelta(minutes=30)).isoformat()
         except ValueError:
             pass
+    if not start_iso:
+        start_iso, end_iso = _resolve_requested_time(requested_time, call_state)
     return start_iso, end_iso
 
 
@@ -164,6 +436,7 @@ def make_action_tools(
     call_state: dict[str, Any],
     persist_hook: Callable[..., Any] | None = None,
     free_busy_check: Callable[[str | None, str | None], bool | None] | None = None,
+    create_event: Callable[..., dict[str, Any] | None] | None = None,
 ) -> list[Callable[..., Any]]:
     """Build the Pipecat action tools as closures over ``call_state``.
 
@@ -173,9 +446,15 @@ def make_action_tools(
             persisted at end-of-call already embeds ``call_state["actions"]``).
             Accepted for symmetry / future inline persistence.
         free_busy_check: optional callable ``(start_iso, end_iso) -> bool|None``
-            from P2's calendar read side. ``True`` = owner free, ``False`` =
+            from the calendar read side. ``True`` = owner free, ``False`` =
             busy, ``None`` = unknown. When busy we still record the request but
             mark it ``needs_reschedule`` rather than booking over a conflict.
+        create_event: optional callable
+            ``(summary, start_iso, end_iso, description, timezone) -> {"id",
+            "htmlLink"} | None`` that creates the event directly (e.g. the
+            connected Google Calendar). When it returns a link the event is
+            booked for real (status ``"booked"``); otherwise we fall back to
+            queueing the request to the outbox bridge.
 
     Returns ``[send_owner_email, book_callback_slot]``.
     """
@@ -193,30 +472,9 @@ def make_action_tools(
             subject: Optional subject line. Defaults to a sensible one built
                 from the caller's name and reason.
         """
-        to_addr = owner_email()
-        snap = call_state.get("caller_snapshot") or {}
-        vm = call_state.get("voicemail") or {}
-        who = snap.get("caller_name") or vm.get("caller_name") or "a caller"
-        why = snap.get("reason") or vm.get("reason") or "a message"
-        subj = subject or f"Voicemail from {who} — {why}"
-        body = build_summary_text(call_state)
-
-        sent = _send_via_smtp(to_addr, subj, body)
-        action = {
-            "action_id": uuid.uuid4().hex,
-            "type": "email",
-            "channel": "gmail",
-            "to": to_addr,
-            "subject": subj,
-            "body": body,
-            "status": "sent" if sent else "queued",
-            "fulfilled_by": "smtp" if sent else "bridge",
-            "timestamp": _now_iso(),
-        }
-        if not sent:
-            action["outbox"] = _append_outbox({"action": "send_email", **action})
-        _record_action(call_state, action)
-        logger.info(f"send_owner_email -> {to_addr} status={action['status']}")
+        action = deliver_owner_email(call_state, subject=subject)
+        to_addr = action.get("to") or owner_email()
+        sent = action.get("status") == "sent"
         await params.result_callback(
             {
                 "ok": True,
@@ -253,9 +511,12 @@ def make_action_tools(
         """
         snap = call_state.get("caller_snapshot") or {}
         who = snap.get("caller_name") or "caller"
-        start_iso, end_iso = _resolve_slot(start_iso, end_iso, requested_time)
+        start_iso, end_iso = _resolve_slot(start_iso, end_iso, requested_time, call_state)
 
         free = free_busy_check(start_iso, end_iso) if free_busy_check else None
+        event_title = title or f"Callback: {who}"
+        description = build_summary_text(call_state)
+
         if free is False:
             status, note = "needs_reschedule", "Owner is busy then — flagged to reschedule."
         else:
@@ -266,22 +527,48 @@ def make_action_tools(
             "type": "calendar",
             "channel": "gcal",
             "calendar": owner_email(),
-            "title": title or f"Callback: {who}",
+            "title": event_title,
             "start_iso": start_iso,
             "end_iso": end_iso,
             "requested_time": requested_time,
             "tentative": True,
             "owner_free": free,
-            "description": build_summary_text(call_state),
+            "description": description,
             "status": status,
             "fulfilled_by": "bridge",
             "timestamp": _now_iso(),
         }
-        event["outbox"] = _append_outbox({"action": "create_event", **event})
+
+        # Real booking path: if a connected calendar is available and the owner
+        # isn't already busy, create the event directly instead of queueing.
+        booked = None
+        if create_event and free is not False:
+            try:
+                booked = create_event(
+                    event_title,
+                    start_iso,
+                    end_iso,
+                    description,
+                    _owner_timezone().key,
+                )
+            except Exception as e:  # never let a calendar hiccup break the call
+                logger.warning(f"actions: create_event hook failed ({type(e).__name__})")
+                booked = None
+
+        if booked and booked.get("htmlLink"):
+            event["status"] = status = "booked"
+            event["fulfilled_by"] = "google_calendar"
+            event["event_id"] = booked.get("id")
+            event["html_link"] = booked.get("htmlLink")
+            note = "Tentative callback event added to your Google Calendar."
+        else:
+            # Fall back to the outbox bridge when no live calendar is connected.
+            event["outbox"] = _append_outbox({"action": "create_event", **event})
+
         _record_action(call_state, event)
         logger.info(
             f"book_callback_slot title='{event['title']}' start={start_iso} "
-            f"free={free} status={status}"
+            f"free={free} status={event['status']}"
         )
         await params.result_callback(
             {

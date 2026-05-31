@@ -1,0 +1,36 @@
+---
+description: MCP connector + outbox drain rules for the WMYhacks voice agent
+alwaysApply: true
+---
+
+# MCP bridge rules
+
+- **Read [`MCP_AGENTS.md`](../../MCP_AGENTS.md) before any Cekura / Gmail /
+  Calendar tool call.** It is the operations contract (session roles, env
+  checklist, drain SOP, verification).
+- The **bot process has no MCP access** — it queues actions to an outbox. Only
+  this agent session can fire connectors.
+
+## After a bot WebRTC test → drain the outbox
+
+```bash
+cd server
+uv run python action_bridge.py --list           # show pending actions
+uv run python action_bridge.py --emit            # print connector call specs
+# execute each printed MCP call (gmail.create_draft / calendar.create_event)
+uv run python action_bridge.py --done <action_id>  # mark fulfilled after success
+```
+
+## Connector conventions
+
+- **Email:** only ever send to `OWNER_EMAIL`. Prefer SMTP (real inbox) when
+  `GMAIL_APP_PASSWORD` is set; the Gmail MCP only exposes `create_draft`.
+- **Calendar:** events are tentative — keep the `[Tentative]` title prefix,
+  Graphite `colorId: "8"`, and the `TENTATIVE —` description note. Requires a
+  Calendar MCP connected with **write** scope.
+- **Cekura:** connect the agent with the **Pipecat** provider; persist runs via
+  `persistence.persist_eval_run` (pull with `results_list` first).
+
+## Docs lookups
+
+Prefer the Nia MCP over `WebFetch`/`WebSearch` for indexed repos and docs.

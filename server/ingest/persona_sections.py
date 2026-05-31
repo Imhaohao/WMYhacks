@@ -78,6 +78,15 @@ def apply_block(text: str, section_header: str, block_id: str, lines: list[str])
     return text[:insert_at] + "\n\n" + block + text[insert_at:]
 
 
+def remove_block(text: str, block_id: str) -> str:
+    """Return `text` without a generated block, leaving curated content intact."""
+    fence = re.compile(
+        r"\n?" + re.escape(_begin(block_id)) + r".*?" + re.escape(_end(block_id)) + r"\n?",
+        re.DOTALL,
+    )
+    return fence.sub("\n", text, count=1)
+
+
 def update_file(
     section_header: str,
     block_id: str,
@@ -92,6 +101,23 @@ def update_file(
     p = Path(path)
     text = p.read_text(encoding="utf-8")
     new = apply_block(text, section_header, block_id, lines)
+    changed = new != text
+    if changed and not dry_run:
+        p.write_text(new, encoding="utf-8")
+    return changed, new
+
+
+def update_optional_file(
+    section_header: str,
+    block_id: str,
+    lines: list[str],
+    path: str | Path = DEFAULT_PATH,
+    dry_run: bool = False,
+) -> tuple[bool, str]:
+    """Write a non-empty block or remove its prior generated block."""
+    p = Path(path)
+    text = p.read_text(encoding="utf-8")
+    new = apply_block(text, section_header, block_id, lines) if lines else remove_block(text, block_id)
     changed = new != text
     if changed and not dry_run:
         p.write_text(new, encoding="utf-8")

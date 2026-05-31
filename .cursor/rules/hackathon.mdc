@@ -1,0 +1,21 @@
+---
+description: WMYhacks hackathon doctrine + model delegation pointer
+alwaysApply: true
+---
+
+# Hackathon doctrine
+
+The single source of truth is [`AGENTS.md`](../../AGENTS.md). Read it for full
+model-routing and delegation rules. Quick reference:
+
+- **Default to Sonnet** for implementation when a spec or handoff doc exists
+  (`P3_NEXT.md`, `INTEGRATION_P3.md`, an agreed plan). Use a flagship model only
+  for routing, ambiguous architecture, or cross-owner coordination.
+- **Delegate** scoped, well-specified work (tests, lint/typecheck fix loops,
+  single-module changes) instead of doing everything inline.
+- Prefer small, targeted edits; read existing code and conventions first; use
+  `rg` for search. Don't revert user changes unless asked.
+- Per-task delegation hints live in [`server/P3_NEXT.md`](../../server/P3_NEXT.md).
+
+For MCP / connector work, see [`.cursor/rules/mcp-bridge.mdc`](mcp-bridge.mdc)
+and [`MCP_AGENTS.md`](../../MCP_AGENTS.md).
