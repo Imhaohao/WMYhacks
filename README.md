@@ -10,6 +10,15 @@ When your phone goes to voicemail, Gotchu answers for you. Gotchu references you
 
 [Demo Link](https://youtu.be/7em2jd1y9fo)
 
+<img width="1728" height="963" alt="gotchu" src="https://github.com/user-attachments/assets/da2115e6-ebe0-4afd-b170-8a59f0e0932e" />
+
+Includes easy onboarding, calendar integration, personalized context, and a seamless voice interaction.
+
+
+<img width="404" height="250" alt="setup" src="https://github.com/user-attachments/assets/67c3580c-66f1-4d3f-bfa6-78950f4c5ebd" />
+<img width="404" height="250" alt="setup2" src="https://github.com/user-attachments/assets/59c12518-f160-48e6-923c-673dc4ce8504" />
+
+
 ## Tech Stack
 
 **Cekura**: We used Cekura extensively during our development process, crafting our system prompt with its evaluation and improvement pipeline. We ran rounds of experiments of seven different scenarios (including but not limited to a spammer, a client, and a friend), evaluated using Cekura on metrics such as persona consistency and task completion. **Cekura** allowed us to build our system prompt _iteratively_, adapting to failures and successes in actual simulated calls.
