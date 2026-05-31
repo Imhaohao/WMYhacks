@@ -70,6 +70,38 @@ import persona_tools  # isort: skip  # P3 — appends 4 tools and on_call_finish
 import cekura_observe  # isort: skip  # Observability: POST call transcript to Cekura on disconnect
 
 
+# ─── Local SmallWebRTC fix: advertise a loopback ICE candidate ───────────────
+def _enable_loopback_ice() -> None:
+    """Let a same-machine browser connect to the SmallWebRTC transport.
+
+    aioice (aiortc's ICE layer) deliberately strips ``127.0.0.1`` from its host
+    candidates, so on a dev box the bot only advertises its LAN IP. The browser
+    and bot are on the same host, and the self-directed UDP connectivity checks
+    on that LAN IP stall (firewall / AP isolation) — the call never reaches
+    ``connected``. Re-adding a loopback candidate makes local ICE complete over
+    the firewall-exempt loopback path. Local dev only; cloud uses Daily/Twilio
+    transports that never touch this code path."""
+    try:
+        from aioice import ice as _aioice_ice
+
+        _orig = _aioice_ice.get_host_addresses
+
+        def _with_loopback(use_ipv4: bool, use_ipv6: bool) -> list[str]:
+            addrs = _orig(use_ipv4, use_ipv6)
+            if use_ipv4 and "127.0.0.1" not in addrs:
+                addrs = ["127.0.0.1", *addrs]
+            return addrs
+
+        _aioice_ice.get_host_addresses = _with_loopback  # type: ignore[assignment]
+        logger.info("Local ICE: loopback (127.0.0.1) candidate enabled for SmallWebRTC")
+    except Exception as exc:  # never block startup over a dev-only convenience
+        logger.warning(f"Could not enable loopback ICE: {exc}")
+
+
+if os.getenv("ENV") == "local":
+    _enable_loopback_ice()
+
+
 # ─── Twilio helper ────────────────────────────────────────────────────────────
 
 
