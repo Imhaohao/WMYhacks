@@ -63,6 +63,12 @@ def _token_path() -> Path:
 
 
 def redirect_uri() -> str:
+    # PUBLIC_BASE_URL is the deploy switch (e.g. a cloudflared tunnel URL): when
+    # set it wins so the OAuth callback comes back to the public host. Local dev
+    # leaves it unset and falls back to the explicit env / localhost default.
+    base = os.getenv("PUBLIC_BASE_URL", "").strip().rstrip("/")
+    if base:
+        return f"{base}/api/calendar/google/callback"
     return os.getenv("GOOGLE_OAUTH_REDIRECT_URI", _DEFAULT_REDIRECT_URI).strip()
 
 

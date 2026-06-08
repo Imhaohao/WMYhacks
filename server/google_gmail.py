@@ -61,6 +61,12 @@ def _token_path() -> Path:
 
 
 def redirect_uri() -> str:
+    # PUBLIC_BASE_URL is the deploy switch (e.g. a cloudflared tunnel URL): when
+    # set it wins so the OAuth callback comes back to the public host. Local dev
+    # leaves it unset and falls back to the explicit env / localhost default.
+    base = os.getenv("PUBLIC_BASE_URL", "").strip().rstrip("/")
+    if base:
+        return f"{base}/api/gmail/google/callback"
     return os.getenv("GOOGLE_GMAIL_REDIRECT_URI", _DEFAULT_REDIRECT_URI).strip()
 
 
@@ -349,6 +355,90 @@ def read_sent_bodies(max_messages: int = 100) -> list[str]:
     except Exception as exc:
         logger.warning(f"google_gmail: sent-mail read failed ({type(exc).__name__})")
         return []
+
+
+# Last read-side API error (e.g. "Gmail API disabled"), surfaced so the voice
+# tool can give an actionable message instead of pretending the inbox is empty.
+_last_read_error: str | None = None
+
+
+def last_read_error() -> str | None:
+    return _last_read_error
+
+
+def _header(headers: list[dict[str, Any]], name: str) -> str:
+    """Case-insensitive header lookup from a Gmail metadata payload."""
+    name_l = name.lower()
+    for h in headers:
+        if str(h.get("name", "")).lower() == name_l:
+            return str(h.get("value", ""))
+    return ""
+
+
+def list_recent(max_results: int = 5, query: str = "") -> list[dict[str, Any]]:
+    """Read recent mailbox messages (owner-facing assistant access).
+
+    Returns lightweight summaries: ``{from, subject, date, snippet, unread}``.
+    ``query`` is a Gmail search string (e.g. ``"is:unread"``, ``"from:alice"``,
+    ``"newer_than:2d"``); an empty query reads the INBOX.
+    """
+    global _last_read_error
+    _last_read_error = None
+    service = _service()
+    if not service:
+        return []
+    try:
+        list_kwargs: dict[str, Any] = {"userId": "me", "maxResults": max_results}
+        if query.strip():
+            list_kwargs["q"] = query.strip()
+        else:
+            list_kwargs["labelIds"] = ["INBOX"]
+        summaries = (
+            service.users().messages().list(**list_kwargs).execute().get("messages", [])
+        )
+        out: list[dict[str, Any]] = []
+        for summary in summaries:
+            mid = summary.get("id")
+            if not mid:
+                continue
+            msg = (
+                service.users()
+                .messages()
+                .get(
+                    userId="me",
+                    id=mid,
+                    format="metadata",
+                    metadataHeaders=["From", "Subject", "Date"],
+                )
+                .execute()
+            )
+            headers = (msg.get("payload") or {}).get("headers") or []
+            out.append(
+                {
+                    "from": _header(headers, "From"),
+                    "subject": _header(headers, "Subject"),
+                    "date": _header(headers, "Date"),
+                    "snippet": str(msg.get("snippet") or ""),
+                    "unread": "UNREAD" in (msg.get("labelIds") or []),
+                }
+            )
+        return out
+    except Exception as exc:
+        detail = str(exc)
+        if "has not been used" in detail or "is disabled" in detail:
+            _last_read_error = (
+                "Gmail API is disabled for this Google Cloud project — enable it in the "
+                "Cloud Console, then retry."
+            )
+        else:
+            _last_read_error = f"Gmail read failed ({type(exc).__name__})."
+        logger.warning(f"google_gmail: inbox read failed ({type(exc).__name__})")
+        return []
+
+
+def search_messages(query: str, max_results: int = 5) -> list[dict[str, Any]]:
+    """Search the owner's mailbox with a Gmail query string. Thin alias of list_recent."""
+    return list_recent(max_results=max_results, query=query)
 
 
 def status() -> dict[str, Any]:

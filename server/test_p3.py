@@ -285,6 +285,31 @@ def test_persist_eval_run(local_persistence):
     assert rec["record_id"] in ids
 
 
+def test_caller_profiles_are_isolated_by_owner(local_persistence):
+    first = persistence.upsert_caller_profile(
+        "+14155550100",
+        caller_name="Sam",
+        reason="owner one topic",
+        owner_context_tag="tenant-one",
+    )
+    second = persistence.upsert_caller_profile(
+        "+14155550100",
+        caller_name="Sam",
+        reason="owner two topic",
+        owner_context_tag="tenant-two",
+    )
+
+    assert first is not None
+    assert second is not None
+    assert first["record_id"] != second["record_id"]
+    owner_one = persistence.get_caller_profile("+14155550100", "tenant-one")
+    owner_two = persistence.get_caller_profile("+14155550100", "tenant-two")
+    assert owner_one is not None
+    assert owner_two is not None
+    assert owner_one["topics"] == ["owner one topic"]
+    assert owner_two["topics"] == ["owner two topic"]
+
+
 # ===========================================================================
 # 3. actions.py
 # ===========================================================================
@@ -327,6 +352,139 @@ def test_send_owner_email_queued(action_state, monkeypatch):
     assert outbox.exists()
     lines = [l for l in outbox.read_text().splitlines() if l.strip()]
     assert len(lines) >= 1
+
+
+def test_tenant_email_does_not_use_demo_owner_gmail_oauth(action_state, monkeypatch):
+    state, _ = action_state
+    state["tenant_runtime"] = {
+        "tenant_id": "tenant-one",
+        "owner_email": "tenant@example.com",
+    }
+    monkeypatch.delenv("RESEND_API_KEY", raising=False)
+    monkeypatch.setattr(
+        actions,
+        "_send_via_gmail_oauth",
+        lambda *_args, **_kwargs: (_ for _ in ()).throw(AssertionError("demo OAuth used")),
+    )
+    monkeypatch.setattr(
+        actions,
+        "_send_via_smtp",
+        lambda *_args, **_kwargs: (_ for _ in ()).throw(AssertionError("demo SMTP used")),
+    )
+    monkeypatch.setattr(actions, "_send_via_tenant_gmail", lambda *_args, **_kwargs: None)
+
+    result = actions.deliver_owner_email(state)
+
+    assert result["status"] == "pending_connection"
+    assert result["to"] == "tenant@example.com"
+    assert "outbox" not in result
+
+
+def test_tenant_email_uses_connected_tenant_gmail(action_state, monkeypatch):
+    state, _ = action_state
+    state["tenant_runtime"] = {
+        "tenant_id": "tenant-one",
+        "owner_email": "tenant@example.com",
+    }
+    monkeypatch.setattr(
+        actions,
+        "_send_via_gmail_oauth",
+        lambda *_args, **_kwargs: (_ for _ in ()).throw(AssertionError("demo OAuth used")),
+    )
+    monkeypatch.setattr(
+        actions,
+        "_send_via_smtp",
+        lambda *_args, **_kwargs: (_ for _ in ()).throw(AssertionError("demo SMTP used")),
+    )
+    monkeypatch.setattr(
+        actions,
+        "_send_via_tenant_gmail",
+        lambda tenant_id, *_args, **_kwargs: {"id": f"{tenant_id}-msg", "threadId": "thread-1"},
+    )
+
+    result = actions.deliver_owner_email(state)
+
+    assert result["status"] == "sent"
+    assert result["fulfilled_by"] == "tenant_google_gmail"
+    assert result["gmail_message_id"] == "tenant-one-msg"
+    assert result["to"] == "tenant@example.com"
+
+
+def test_tenant_calendar_does_not_queue_demo_owner_bridge(action_state, monkeypatch):
+    state, outbox = action_state
+    state["tenant_runtime"] = {
+        "tenant_id": "tenant-one",
+        "owner_email": "tenant@example.com",
+        "timezone": "America/Los_Angeles",
+    }
+    monkeypatch.setattr(actions, "_tenant_calendar_connected", lambda tenant_id: False)
+    _, book_fn = actions.make_action_tools(state)
+    fp = FakeParams()
+
+    asyncio.run(book_fn(fp, requested_time="tomorrow morning"))
+
+    assert fp.last["status"] == "pending_connection"
+    assert state["actions"][-1]["calendar"] == "tenant@example.com"
+    assert "outbox" not in state["actions"][-1]
+    assert not outbox.exists()
+
+
+def test_tenant_calendar_books_with_connected_calendar(action_state, monkeypatch):
+    state, outbox = action_state
+    state["tenant_runtime"] = {
+        "tenant_id": "tenant-one",
+        "owner_email": "tenant@example.com",
+        "timezone": "America/Los_Angeles",
+    }
+    seen: dict[str, str | None] = {}
+    monkeypatch.setattr(actions, "_tenant_calendar_connected", lambda tenant_id: True)
+    monkeypatch.setattr(actions, "_tenant_calendar_is_free", lambda tenant_id, start, end: True)
+
+    def create_event(tenant_id, title, start, end, description, timezone):
+        seen.update(
+            tenant_id=tenant_id,
+            title=title,
+            start=start,
+            end=end,
+            timezone=timezone,
+        )
+        return {"id": "evt-tenant", "htmlLink": "https://calendar.example/evt-tenant"}
+
+    monkeypatch.setattr(actions, "_tenant_calendar_create_event", create_event)
+    _, book_fn = actions.make_action_tools(state)
+    fp = FakeParams()
+
+    asyncio.run(book_fn(fp, requested_time="tomorrow morning"))
+
+    assert fp.last["status"] == "booked"
+    assert seen["tenant_id"] == "tenant-one"
+    assert state["actions"][-1]["fulfilled_by"] == "tenant_google_calendar"
+    assert state["actions"][-1]["event_id"] == "evt-tenant"
+    assert "outbox" not in state["actions"][-1]
+    assert not outbox.exists()
+
+
+def test_tenant_calendar_busy_needs_reschedule(action_state, monkeypatch):
+    state, _ = action_state
+    state["tenant_runtime"] = {
+        "tenant_id": "tenant-one",
+        "owner_email": "tenant@example.com",
+        "timezone": "America/Los_Angeles",
+    }
+    monkeypatch.setattr(actions, "_tenant_calendar_connected", lambda tenant_id: True)
+    monkeypatch.setattr(actions, "_tenant_calendar_is_free", lambda tenant_id, start, end: False)
+    monkeypatch.setattr(
+        actions,
+        "_tenant_calendar_create_event",
+        lambda *_args, **_kwargs: (_ for _ in ()).throw(AssertionError("busy slot booked")),
+    )
+    _, book_fn = actions.make_action_tools(state)
+    fp = FakeParams()
+
+    asyncio.run(book_fn(fp, requested_time="tomorrow morning"))
+
+    assert fp.last["status"] == "needs_reschedule"
+    assert state["actions"][-1]["owner_free"] is False
 
 
 def test_book_callback_no_free_busy(action_state):
@@ -466,6 +624,20 @@ def test_observe_transcript_frame_ignores_blank():
     state: dict[str, Any] = {"caller_snapshot": caller_snapshot.fresh_snapshot()}
     assert persona_tools.observe_transcript_frame(state, _FakeFrame("   ")) is None
     assert persona_tools.observe_transcript_frame(state, _FakeFrame("")) is None
+
+
+def test_observe_transcript_frame_appends_voicemail_transcript():
+    import persona_tools
+
+    state: dict[str, Any] = {
+        "voicemail": {"transcript": ""},
+        "caller_snapshot": caller_snapshot.fresh_snapshot(),
+    }
+    persona_tools.observe_transcript_frame(state, _FakeFrame("  Please call me back.  "))
+    persona_tools.observe_transcript_frame(state, _FakeFrame("Tomorrow morning works."))
+    assert state["voicemail"]["transcript"] == (
+        "Caller: Please call me back.\nCaller: Tomorrow morning works."
+    )
 
 
 def test_sync_voicemail_to_snapshot_mirrors_p1_captures():
@@ -745,6 +917,50 @@ def test_calendar_context_refuses_unknown_caller(monkeypatch):
 
     assert fp.last["authorized"] is False
     assert called["calendar"] is False
+
+
+def test_tenant_calendar_context_uses_tenant_google_not_demo_calendar(monkeypatch):
+    import persona_tools
+
+    monkeypatch.setattr(
+        persona_tools.google_calendar,
+        "explain_date_conflict",
+        lambda *_a, **_k: (_ for _ in ()).throw(AssertionError("demo calendar used")),
+    )
+    monkeypatch.setattr(
+        persona_tools,
+        "_tenant_calendar_context",
+        lambda *_a, **_k: {
+            "date": "2026-05-30",
+            "related_event_found": True,
+            "reason": "Voice Agent YC Hackathon",
+            "source": "tenant_google_calendar",
+        },
+    )
+    snap = caller_snapshot.fresh_snapshot()
+    snap["known_caller"] = True
+    snap["caller_name"] = "David Wu"
+    state: dict[str, Any] = {
+        "caller_snapshot": snap,
+        "tenant_runtime": {
+            "tenant_id": "tenant-one",
+            "timezone": "America/Los_Angeles",
+        },
+    }
+    fp = FakeParams()
+    asyncio.run(
+        persona_tools.get_calendar_context_for_caller(
+            fp,
+            state,
+            date="2026-05-30",
+            topic="my birthday",
+        )
+    )
+
+    assert fp.last["authorized"] is True
+    assert fp.last["context_available"] is True
+    assert fp.last["source"] == "tenant_google_calendar"
+    assert "Voice Agent YC Hackathon" in fp.last["answer_hint"]
 
 
 def test_calendar_context_falls_back_to_persona_when_live_calendar_unavailable(monkeypatch):

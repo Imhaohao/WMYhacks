@@ -158,7 +158,7 @@ def infer_tone_from_text(text: str) -> str | None:
 
 # Task 3 mapping. These are short, spoken-style directives the LLM can act on.
 _ADAPTATION: dict[str, str] = {
-    "rushed": "Caller is rushed — be brief, skip pleasantries, ask only the essential question.",
+    "rushed": "Caller is rushed/urgent — keep it brief and skip pleasantries, but speak in a calm, steady, unhurried voice; your composure settles their pace.",
     "upset": "Caller is upset — slow down, stay warm and calm, acknowledge the frustration before asking anything.",
     "confused": "Caller is confused — ask one simple question at a time and avoid jargon or compound questions.",
     "rambling": "Caller is rambling — gently add structure: summarize, then ask one focused question to move forward.",

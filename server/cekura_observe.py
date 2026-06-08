@@ -34,6 +34,7 @@ from __future__ import annotations
 import json
 import os
 import re
+from collections.abc import Mapping, Sequence
 from datetime import UTC, datetime, timezone
 from pathlib import Path
 from typing import Any
@@ -72,7 +73,7 @@ def _resolve_agent_id(passed_id: int | None) -> int | None:
 # ─── Transcript helpers ───────────────────────────────────────────────────────
 
 
-def _turns_from_context_messages(messages: list[dict]) -> list[dict]:
+def _turns_from_context_messages(messages: Sequence[Any]) -> list[dict]:
     """Convert LLMContext message list to Cekura 'cekura' transcript format.
 
     Roles:
@@ -154,7 +155,7 @@ def _turns_from_string_transcript(raw: str) -> list[dict]:
 
 
 async def observe_call(
-    call_state: dict,
+    call_state: Mapping[str, Any],
     *,
     call_id: str,
     agent_id: int | None = None,

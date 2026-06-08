@@ -3,7 +3,7 @@
 from __future__ import annotations
 
 from ingest.memo_context import derive_prompt_lingo_lines
-from ingest.voice_lingo import derive_lingo, render_lingo_lines
+from ingest.voice_lingo import derive_lingo, derive_onboarding_lingo, render_lingo_lines
 
 
 def test_extracts_repeated_slang_acronym_and_litotes():
@@ -59,3 +59,21 @@ def test_prompt_lingo_drops_repeated_technical_vocabulary():
     rendered = " ".join(lines)
     assert "yo bro" in rendered and "not bad" in rendered
     assert "README" not in rendered and "XML" not in rendered and "SMTP" not in rendered
+
+
+def test_onboarding_lingo_combines_safe_explicit_phrases_and_style_notes():
+    profile = derive_onboarding_lingo(
+        [
+            "gotchu, i'll take a look",
+            "gotchu, i'll circle back",
+            "gotchu, talk soon",
+        ],
+        explicit_phrases=["gotchu", "talk soon", "jane@example.com", "sk-secretvalue123456"],
+    )
+
+    assert "talk soon" in profile.phrases
+    assert "gotchu" in profile.phrases
+    assert "jane@example.com" not in " ".join(profile.phrases)
+    assert "sk-secretvalue123456" not in " ".join(profile.phrases)
+    assert "Uses casual contractions and relaxed spoken phrasing." in profile.style_notes
+    assert "Prefers short, direct replies." in profile.style_notes

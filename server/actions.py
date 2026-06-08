@@ -60,7 +60,11 @@ _DEFAULT_OUTBOX = Path(__file__).parent / "outbox" / "actions.jsonl"
 DEFAULT_OWNER_EMAIL = "imzihaoi@gmail.com"
 
 
-def owner_email() -> str:
+def owner_email(call_state: dict[str, Any] | None = None) -> str:
+    tenant_runtime = (call_state or {}).get("tenant_runtime") or {}
+    tenant_email = str(tenant_runtime.get("owner_email") or "").strip()
+    if tenant_email:
+        return tenant_email
     env_email = os.getenv("OWNER_EMAIL", "").strip()
     if env_email:
         return env_email
@@ -177,6 +181,30 @@ def _send_via_gmail_oauth(to_addr: str, subject: str, body: str) -> dict[str, An
         return None
 
 
+def _tenant_id(call_state: dict[str, Any]) -> str:
+    tenant_runtime = call_state.get("tenant_runtime") or {}
+    return str(tenant_runtime.get("tenant_id") or "").strip()
+
+
+def _send_via_tenant_gmail(
+    tenant_id: str,
+    to_addr: str,
+    subject: str,
+    body: str,
+) -> dict[str, Any] | None:
+    """Send through one tenant's connected Gmail OAuth account, if available."""
+    if not tenant_id:
+        return None
+    try:
+        import tenant_google
+
+        sender = os.getenv("GMAIL_SENDER", to_addr).strip() or to_addr
+        return tenant_google.send_gmail(tenant_id, to_addr, subject, body, sender=sender)
+    except Exception as e:
+        logger.warning(f"actions: tenant Gmail send failed ({type(e).__name__}); will fall back")
+        return None
+
+
 def _send_via_resend(to_addr: str, subject: str, body: str) -> bool:
     """Send through Resend's HTTPS API. Returns True on success."""
     api_key = os.getenv("RESEND_API_KEY", "").strip()
@@ -262,7 +290,7 @@ def deliver_owner_email(
     """
     vm = call_state.setdefault("voicemail", {})
     if vm.get("email_sent"):
-        return {"status": "already_sent", "to": owner_email()}
+        return {"status": "already_sent", "to": owner_email(call_state)}
 
     if not _has_email_content(call_state):
         return {"status": "skipped", "reason": "no caller content captured"}
@@ -274,12 +302,18 @@ def deliver_owner_email(
     why = msg.get("reason") or flat.get("reason") or snap.get("reason") or "a message"
     subj = subject or f"Voicemail from {who} — {why}"
     body = (vm.get("summary") or "").strip() or build_summary_text(call_state)
-    to_addr = owner_email()
+    to_addr = owner_email(call_state)
 
-    gmail_sent = _send_via_gmail_oauth(to_addr, subj, body)
-    sent_by = "google_gmail" if gmail_sent else None
+    tenant_runtime = call_state.get("tenant_runtime") or {}
+    tenant_id = _tenant_id(call_state)
+    if tenant_runtime:
+        gmail_sent = _send_via_tenant_gmail(tenant_id, to_addr, subj, body)
+        sent_by = "tenant_google_gmail" if gmail_sent else None
+    else:
+        gmail_sent = _send_via_gmail_oauth(to_addr, subj, body)
+        sent_by = "google_gmail" if gmail_sent else None
     sent = bool(gmail_sent)
-    if not sent:
+    if not sent and not tenant_runtime:
         sent = _send_via_smtp(to_addr, subj, body)
         sent_by = "smtp" if sent else sent_by
     if not sent:
@@ -293,14 +327,14 @@ def deliver_owner_email(
         "to": to_addr,
         "subject": subj,
         "body": body,
-        "status": "sent" if sent else "queued",
-        "fulfilled_by": sent_by or "bridge",
+        "status": "sent" if sent else ("pending_connection" if tenant_runtime else "queued"),
+        "fulfilled_by": sent_by or ("tenant_email_connection" if tenant_runtime else "bridge"),
         "timestamp": _now_iso(),
     }
     if gmail_sent:
         action["gmail_message_id"] = gmail_sent.get("id")
         action["gmail_thread_id"] = gmail_sent.get("threadId")
-    if not sent:
+    if not sent and not tenant_runtime:
         action["outbox"] = _append_outbox({"action": "send_email", **action})
     _record_action(call_state, action)
     if sent:
@@ -311,9 +345,12 @@ def deliver_owner_email(
 
 # --- Calendar helpers -------------------------------------------------------
 
-def _owner_timezone() -> ZoneInfo:
+def _owner_timezone(call_state: dict[str, Any] | None = None) -> ZoneInfo:
     try:
-        tz = os.getenv("OWNER_TZ", "").strip()
+        tenant_runtime = (call_state or {}).get("tenant_runtime") or {}
+        tz = str(tenant_runtime.get("timezone") or "").strip()
+        if not tz:
+            tz = os.getenv("OWNER_TZ", "").strip()
         if not tz:
             try:
                 import owner_config
@@ -371,7 +408,7 @@ def _resolve_requested_time(
         return None, None
 
     text = requested_time.lower().strip()
-    tz = _owner_timezone()
+    tz = _owner_timezone(call_state)
     base = _call_base_time(call_state, tz)
     day = base.date()
     explicit_today = "today" in text
@@ -430,6 +467,60 @@ def _resolve_slot(
     return start_iso, end_iso
 
 
+def _tenant_calendar_connected(tenant_id: str) -> bool:
+    if not tenant_id:
+        return False
+    try:
+        import tenant_google
+
+        return tenant_google.is_connected(tenant_id, "calendar")
+    except Exception as e:
+        logger.warning(f"actions: tenant calendar status failed ({type(e).__name__})")
+        return False
+
+
+def _tenant_calendar_is_free(
+    tenant_id: str,
+    start_iso: str | None,
+    end_iso: str | None,
+) -> bool | None:
+    if not tenant_id:
+        return None
+    try:
+        import tenant_google
+
+        return tenant_google.calendar_is_free(tenant_id, start_iso, end_iso)
+    except Exception as e:
+        logger.warning(f"actions: tenant calendar free/busy failed ({type(e).__name__})")
+        return None
+
+
+def _tenant_calendar_create_event(
+    tenant_id: str,
+    summary: str,
+    start_iso: str | None,
+    end_iso: str | None,
+    description: str,
+    timezone: str,
+) -> dict[str, Any] | None:
+    if not tenant_id:
+        return None
+    try:
+        import tenant_google
+
+        return tenant_google.create_calendar_event(
+            tenant_id,
+            summary,
+            start_iso,
+            end_iso,
+            description,
+            timezone,
+        )
+    except Exception as e:
+        logger.warning(f"actions: tenant calendar create failed ({type(e).__name__})")
+        return None
+
+
 # --- Tool factory -----------------------------------------------------------
 
 def make_action_tools(
@@ -473,7 +564,7 @@ def make_action_tools(
                 from the caller's name and reason.
         """
         action = deliver_owner_email(call_state, subject=subject)
-        to_addr = action.get("to") or owner_email()
+        to_addr = action.get("to") or owner_email(call_state)
         sent = action.get("status") == "sent"
         await params.result_callback(
             {
@@ -510,14 +601,26 @@ def make_action_tools(
                 caller's name.
         """
         snap = call_state.get("caller_snapshot") or {}
+        tenant_runtime = call_state.get("tenant_runtime") or {}
+        tenant_id = _tenant_id(call_state)
         who = snap.get("caller_name") or "caller"
         start_iso, end_iso = _resolve_slot(start_iso, end_iso, requested_time, call_state)
 
         free = free_busy_check(start_iso, end_iso) if free_busy_check else None
+        tenant_calendar_connected = False
+        if tenant_runtime:
+            tenant_calendar_connected = _tenant_calendar_connected(tenant_id)
+            if tenant_calendar_connected:
+                free = _tenant_calendar_is_free(tenant_id, start_iso, end_iso)
         event_title = title or f"Callback: {who}"
         description = build_summary_text(call_state)
 
-        if free is False:
+        if tenant_runtime and not tenant_calendar_connected:
+            status, note = (
+                "pending_connection",
+                "Saved the callback request. This owner's calendar is not connected yet.",
+            )
+        elif free is False:
             status, note = "needs_reschedule", "Owner is busy then — flagged to reschedule."
         else:
             status, note = "queued", "Tentative callback slot queued for the owner's calendar."
@@ -526,7 +629,7 @@ def make_action_tools(
             "action_id": uuid.uuid4().hex,
             "type": "calendar",
             "channel": "gcal",
-            "calendar": owner_email(),
+            "calendar": owner_email(call_state),
             "title": event_title,
             "start_iso": start_iso,
             "end_iso": end_iso,
@@ -535,7 +638,9 @@ def make_action_tools(
             "owner_free": free,
             "description": description,
             "status": status,
-            "fulfilled_by": "bridge",
+            "fulfilled_by": (
+                "tenant_google_calendar" if tenant_calendar_connected else "bridge"
+            ),
             "timestamp": _now_iso(),
         }
 
@@ -549,19 +654,30 @@ def make_action_tools(
                     start_iso,
                     end_iso,
                     description,
-                    _owner_timezone().key,
+                    _owner_timezone(call_state).key,
                 )
             except Exception as e:  # never let a calendar hiccup break the call
                 logger.warning(f"actions: create_event hook failed ({type(e).__name__})")
                 booked = None
+        elif tenant_calendar_connected and free is not False:
+            booked = _tenant_calendar_create_event(
+                tenant_id,
+                event_title,
+                start_iso,
+                end_iso,
+                description,
+                _owner_timezone(call_state).key,
+            )
 
         if booked and booked.get("htmlLink"):
             event["status"] = status = "booked"
-            event["fulfilled_by"] = "google_calendar"
+            event["fulfilled_by"] = (
+                "tenant_google_calendar" if tenant_calendar_connected else "google_calendar"
+            )
             event["event_id"] = booked.get("id")
             event["html_link"] = booked.get("htmlLink")
             note = "Tentative callback event added to your Google Calendar."
-        else:
+        elif not tenant_runtime:
             # Fall back to the outbox bridge when no live calendar is connected.
             event["outbox"] = _append_outbox({"action": "create_event", **event})
 

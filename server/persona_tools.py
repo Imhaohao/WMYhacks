@@ -221,10 +221,11 @@ async def lookup_persona(
     incoming_number = call_state["voicemail"]["caller_number"] or ""
     number = incoming_number or caller_number or ""
     verification_method = "incoming_phone" if incoming_number else None
-    match = _persona_lookup(number)
+    # Cloud tenants do not inherit the demo owner's local address book.
+    match = None if call_state.get("tenant_runtime") else _persona_lookup(number)
     if match and not verification_method:
         verification_method = "stated_phone_demo"
-    if not match and not incoming_number and caller_name:
+    if not match and not incoming_number and caller_name and not call_state.get("tenant_runtime"):
         match = _persona_lookup_name(caller_name)
         if match:
             verification_method = "stated_name_demo"
@@ -287,7 +288,9 @@ def greeting_for_caller(call_state: Any) -> str | None:
     try:
         snap: dict[str, Any] = call_state["caller_snapshot"]  # type: ignore[assignment]
         number = call_state["voicemail"]["caller_number"] or ""
-        match = _persona_lookup(number)
+        # Tenant contact ingestion is a separate per-owner integration. Never
+        # fall through to the demo owner's Mac contacts.
+        match = None if call_state.get("tenant_runtime") else _persona_lookup(number)
         if not match:
             snap["known_caller"] = False
             snap["persona_id"] = None
@@ -405,6 +408,35 @@ def _calendar_answer_hint(result: dict[str, Any]) -> str:
     )
 
 
+def _tenant_calendar_context(
+    call_state: CallState,
+    date: str | None,
+    topic: str | None,
+) -> dict[str, Any] | None:
+    tenant_runtime = call_state.get("tenant_runtime") or {}
+    tenant_id = str(tenant_runtime.get("tenant_id") or "").strip()
+    tz_name = str(tenant_runtime.get("timezone") or "America/Los_Angeles").strip()
+    if not tenant_id:
+        return None
+    try:
+        import tenant_google
+
+        if not tenant_google.is_connected(tenant_id, "calendar"):
+            return None
+        query_date = date or dt.datetime.now(ZoneInfo(tz_name)).date().isoformat()
+        snap: dict[str, Any] = call_state["caller_snapshot"]  # type: ignore[assignment]
+        return tenant_google.explain_calendar_date_conflict(
+            tenant_id,
+            query_date,
+            caller_name=str(snap.get("caller_name") or ""),
+            topic=topic,
+            timezone=tz_name,
+        )
+    except Exception as exc:
+        logger.warning(f"tenant calendar context unavailable — {type(exc).__name__}")
+        return None
+
+
 async def get_calendar_context_for_caller(
     params: FunctionCallParams,
     call_state: CallState,
@@ -430,6 +462,30 @@ async def get_calendar_context_for_caller(
                 "answer_hint": (
                     "Do not disclose calendar context. Ask for the caller's name and run "
                     "lookup_persona, or offer to take a message."
+                ),
+            }
+        )
+        return
+    if call_state.get("tenant_runtime"):
+        result = _tenant_calendar_context(call_state, date, topic)
+        if result:
+            await params.result_callback(
+                {
+                    "authorized": True,
+                    "context_available": True,
+                    "related_event_found": result.get("related_event_found", False),
+                    "answer_hint": _calendar_answer_hint(result),
+                    "source": result.get("source", "tenant_google_calendar"),
+                }
+            )
+            return
+        await params.result_callback(
+            {
+                "authorized": True,
+                "context_available": False,
+                "answer_hint": (
+                    "This owner's calendar is not connected yet. Say you are not sure "
+                    "and offer to take a message."
                 ),
             }
         )
@@ -536,8 +592,8 @@ async def book_callback_slot(
     """
     tools = actions.make_action_tools(
         call_state,  # type: ignore[arg-type]
-        free_busy_check=calendar_free_busy_check,
-        create_event=google_calendar.create_event,
+        free_busy_check=None if call_state.get("tenant_runtime") else calendar_free_busy_check,
+        create_event=None if call_state.get("tenant_runtime") else google_calendar.create_event,
     )
     book_fn = next(fn for fn in tools if fn.__name__ == "book_callback_slot")
     await book_fn(
@@ -567,9 +623,12 @@ def on_call_finished(call_state: CallState) -> str | None:
         snap: dict[str, Any] = call_state["caller_snapshot"]  # type: ignore[assignment]
         cs.normalize_to_contract(snap)
         persona_ctx = call_state.get("persona_context") or ""
+        tenant_runtime = call_state.get("tenant_runtime") or {}
         # Use a short tag from P2's persona_context as the owner-context tag —
         # the full context lives in the prompt, the tag is just a record label.
-        owner_tag = (persona_ctx[:120] + "…") if len(persona_ctx) > 120 else persona_ctx
+        owner_tag = str(tenant_runtime.get("tenant_id") or "")
+        if not owner_tag:
+            owner_tag = (persona_ctx[:120] + "…") if len(persona_ctx) > 120 else persona_ctx
         record = persistence.persist_voicemail(
             voicemail=dict(call_state["voicemail"]),  # type: ignore[arg-type]
             caller_snapshot=cs.public_snapshot(snap),
@@ -594,6 +653,7 @@ def on_call_finished(call_state: CallState) -> str | None:
                 summary=vm.get("summary"),
                 persona_id=snap.get("persona_id"),
                 call_record_id=record_id,
+                owner_context_tag=owner_tag or None,
             )
         except Exception as exc:
             logger.error(f"P3 on_call_finished: caller profile skipped — {exc}")
@@ -625,13 +685,24 @@ def observe_transcript_frame(call_state: Any, frame: Any) -> str | None:
     text = getattr(frame, "text", None)
     if not text or not str(text).strip():
         return None
+    text = str(text).strip()
+    voicemail = call_state.get("voicemail")
+    if isinstance(voicemail, dict):
+        transcript = str(voicemail.get("transcript") or "").strip()
+        voicemail["transcript"] = "\n".join(
+            part for part in (transcript, f"Caller: {text}") if part
+        )
     snap: dict[str, Any] = call_state["caller_snapshot"]  # type: ignore[assignment]
-    tone = cs.observe_caller_tone(snap, str(text))
+    tone = cs.observe_caller_tone(snap, text)
     cs.normalize_to_contract(snap)
     return tone
 
 
-def make_transcript_tone_processor(call_state: CallState, context: Any | None = None) -> Any:
+def make_transcript_tone_processor(
+    call_state: CallState,
+    context: Any | None = None,
+    pace_cb: Any | None = None,
+) -> Any:
     """Build a passthrough Pipecat ``FrameProcessor`` that auto-infers caller
     tone from final transcripts.
 
@@ -647,10 +718,11 @@ def make_transcript_tone_processor(call_state: CallState, context: Any | None = 
     from pipecat.processors.frame_processor import FrameDirection, FrameProcessor
 
     class _TranscriptToneListener(FrameProcessor):
-        def __init__(self, state: CallState, llm_context: Any | None) -> None:
+        def __init__(self, state: CallState, llm_context: Any | None, on_pace: Any | None) -> None:
             super().__init__()
             self._state = state
             self._context = llm_context
+            self._on_pace = on_pace
 
         async def process_frame(self, frame: Any, direction: FrameDirection) -> None:
             await super().process_frame(frame, direction)
@@ -659,14 +731,18 @@ def make_transcript_tone_processor(call_state: CallState, context: Any | None = 
                 frame, InterimTranscriptionFrame
             ):
                 try:
-                    observe_transcript_frame(self._state, frame)
+                    tone = observe_transcript_frame(self._state, frame)
                     if self._context is not None:
                         refresh_live_style_directive(self._state, self._context)
+                    # Feed the inferred tone to the speaking-pace controller (if any)
+                    # so the agent slows down for rushed / upset callers.
+                    if self._on_pace is not None:
+                        self._on_pace(tone)
                 except Exception as exc:  # never break the audio pipeline
                     logger.warning(f"transcript tone listener skipped — {exc}")
             await self.push_frame(frame, direction)
 
-    return _TranscriptToneListener(call_state, context)
+    return _TranscriptToneListener(call_state, context, pace_cb)
 
 
 # ─── Registry append (runs at import time) ───────────────────────────────────

@@ -108,6 +108,12 @@ _LITOTES = re.compile(
     r"\bnot\s+(?:too\s+)?(?:awful|bad|crazy|impossible|really|terrible|uncommon|unlikely|wrong)\b",
     re.IGNORECASE,
 )
+_CONTRACTIONS = re.compile(
+    r"\b(?:ain't|aren't|can't|couldn't|didn't|doesn't|don't|gonna|gotta|"
+    r"i'll|i'm|isn't|lemme|shouldn't|that's|they're|wanna|we'll|we're|won't|"
+    r"wouldn't|you're)\b",
+    re.IGNORECASE,
+)
 
 
 @dataclass(frozen=True)
@@ -179,12 +185,17 @@ def derive_lingo(
     seen_in: dict[str, set[int]] = defaultdict(set)
     score_boost: Counter[str] = Counter()
     litotes_messages = 0
+    contraction_messages = 0
+    word_counts: list[int] = []
 
     for index, text in enumerate(texts):
         words = _tokens(text)
         normalized_text = " ".join(word[1] for word in words)
+        word_counts.append(len(words))
         if _LITOTES.search(normalized_text):
             litotes_messages += 1
+        if _CONTRACTIONS.search(text):
+            contraction_messages += 1
         for size in (1, 2, 3):
             for start in range(0, len(words) - size + 1):
                 phrase_words = tuple(words[start : start + size])
@@ -227,7 +238,54 @@ def derive_lingo(
     notes = []
     if litotes_messages >= min_messages:
         notes.append("Uses understated negation or litotes when it fits.")
+    if contraction_messages >= min_messages:
+        notes.append("Uses casual contractions and relaxed spoken phrasing.")
+    if word_counts and sum(word_counts) / len(word_counts) <= 14:
+        notes.append("Prefers short, direct replies.")
     return LingoProfile(phrases=phrases, style_notes=notes)
+
+
+def derive_onboarding_lingo(
+    texts: list[str],
+    *,
+    explicit_phrases: list[str] | None = None,
+    max_phrases: int = 6,
+) -> LingoProfile:
+    """Build a safe owner profile from guided onboarding replies.
+
+    Explicit phrases are owner-selected hints, so they may be generic. They
+    still go through the same sensitive-value stripping and short-snippet cap as
+    automatically derived phrases. Raw onboarding replies are never returned.
+    """
+    derived = derive_lingo(
+        texts,
+        min_messages=2,
+        generic_min_messages=2,
+        max_phrases=max_phrases,
+        allow_acronyms=False,
+    )
+    phrases: list[str] = []
+    for phrase in explicit_phrases or []:
+        words = tuple(_tokens(phrase))
+        if not 1 <= len(words) <= 3:
+            continue
+        display = _display(words)
+        if not display or any(
+            display.lower() in selected.lower() or selected.lower() in display.lower()
+            for selected in phrases
+        ):
+            continue
+        phrases.append(display)
+        if len(phrases) >= max_phrases:
+            break
+    for phrase in derived.phrases:
+        lowered = phrase.lower()
+        if any(lowered in selected.lower() or selected.lower() in lowered for selected in phrases):
+            continue
+        phrases.append(phrase)
+        if len(phrases) >= max_phrases:
+            break
+    return LingoProfile(phrases=phrases, style_notes=derived.style_notes)
 
 
 def render_lingo_lines(profile: LingoProfile, source_label: str) -> list[str]:
@@ -236,8 +294,10 @@ def render_lingo_lines(profile: LingoProfile, source_label: str) -> list[str]:
     if profile.phrases:
         quoted = ", ".join(f'"{phrase}"' for phrase in profile.phrases)
         lines.append(
-            f"- {source_label} lingo: naturally and sparingly uses {quoted}; "
-            "match the caller and setting instead of forcing slang."
+            f"- {source_label} voice — this is how I actually talk, so sound like me, "
+            f"not a generic assistant: naturally and sparingly use my real phrasing such as "
+            f"{quoted}. Keep it genuine and relaxed, match the setting instead of forcing "
+            "slang, and don't lean on any single phrase every turn."
         )
     lines.extend(f"- {note}" for note in profile.style_notes)
     return lines

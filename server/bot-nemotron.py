@@ -4,14 +4,15 @@
 # SPDX-License-Identifier: BSD 2-Clause License
 #
 
-"""Personal voicemail agent — Nemotron voice path (hackathon build).
+"""Personal voicemail agent — Nemotron or OpenAI Realtime voice path.
 
 The bot answers inbound calls on the owner's behalf, takes a complete message,
 and routes it via Twilio SMS and/or Gmail.  Calendar callbacks and caller-persona
 enrichment are handled by P2 and P3 modules that append to TOOL_REGISTRY in
 server/interfaces.py.
 
-Pipeline: Gradium STT → Nemotron-3-Super-120B LLM → Gradium (cloned-voice) TTS
+Cascade pipeline: Gradium STT → Nemotron-3-Super-120B LLM → Gradium TTS
+Realtime pipeline: OpenAI Realtime audio input + text LLM → Gradium cloned-voice TTS
 
 Run locally::
 
@@ -24,6 +25,7 @@ import os
 import time
 from pathlib import Path
 from typing import Any, cast
+from urllib.parse import parse_qs
 
 import aiohttp
 from dotenv import load_dotenv
@@ -37,6 +39,9 @@ from pipecat.frames.frames import (
     InterimTranscriptionFrame,
     LLMRunFrame,
     TranscriptionFrame,
+    TTSSpeakFrame,
+    TTSStartedFrame,
+    TTSStoppedFrame,
 )
 from pipecat.pipeline.pipeline import Pipeline
 from pipecat.pipeline.worker import PipelineParams, PipelineWorker
@@ -56,6 +61,16 @@ from pipecat.serializers.protobuf import ProtobufFrameSerializer
 from pipecat.serializers.twilio import TwilioFrameSerializer
 from pipecat.services.gradium.tts import GradiumTTSService
 from pipecat.services.llm_service import FunctionCallParams
+from pipecat.services.openai.realtime.events import (
+    AudioConfiguration,
+    AudioInput,
+    InputAudioNoiseReduction,
+    InputAudioTranscription,
+    Reasoning,
+    SemanticTurnDetection,
+    SessionProperties,
+)
+from pipecat.services.openai.realtime.llm import OpenAIRealtimeLLMService
 from pipecat.transports.base_transport import BaseTransport, TransportParams
 from pipecat.transports.smallwebrtc.connection import SmallWebRTCConnection
 from pipecat.transports.smallwebrtc.transport import SmallWebRTCTransport
@@ -66,9 +81,11 @@ _ENV_DIR = Path(__file__).resolve().parent
 load_dotenv(_ENV_DIR / ".env", override=True)
 load_dotenv(_ENV_DIR / ".env.local", override=True)
 from pipecat.services.gradium.stt import GradiumSTTService
+from pipecat.services.openai.stt import OpenAISTTService
 from pipecat.transcriptions.language import Language
 
 import caller_snapshot as cs
+import tenant_store
 from interfaces import (
     TOOL_REGISTRY,
     CallState,
@@ -83,7 +100,73 @@ from nemotron_llm import VLLMOpenAILLMService
 #   import calendar_tools   # P2 — appends book_callback_slot, get_calendar_availability
 
 import persona_tools  # isort: skip  # P3 — appends 4 tools and on_call_finished hook
+import owner_tools  # isort: skip  # appends github / gmail-read / reminders tools
 import cekura_observe  # isort: skip  # Observability: POST call transcript to Cekura on disconnect
+import tenant_runtime  # isort: skip  # shared/dedicated tenant call routing
+
+
+def _attach_onboarding_api_to_runner() -> None:
+    """Expose onboarding API routes on the same FastAPI app as the voice worker.
+
+    The public phone domain already has to point at this worker for Twilio's
+    POST / webhook and /ws media stream. In production-like tenant onboarding,
+    the web app can also point VITE_ONBOARDING_API_URL at that same origin and
+    use /api/* without needing a second tunnel or backend host.
+    """
+    if os.getenv("ENABLE_ONBOARDING_API_ON_VOICE_WORKER", "").strip().lower() != "true":
+        return
+    try:
+        from fastapi import Request
+        from fastapi.responses import HTMLResponse
+        from pipecat.runner.run import app as runner_app
+
+        import onboarding_api
+
+        existing = {
+            (getattr(route, "path", ""), tuple(sorted(getattr(route, "methods", []) or [])))
+            for route in runner_app.router.routes
+        }
+        if ("/", ("POST",)) not in existing:
+
+            @runner_app.post("/")
+            async def gotchu_twilio_start_call(request: Request):
+                """Return TwiML and pass Twilio's first-webhook metadata into /ws."""
+                raw_body = await request.body()
+                form = {
+                    key: values[-1]
+                    for key, values in parse_qs(raw_body.decode("utf-8", errors="ignore")).items()
+                    if values
+                }
+                call_info = tenant_runtime.call_info_from_twilio_parameters(form)
+                if call_info:
+                    logger.info(
+                        "Twilio webhook: from={} to={} forwarded_from={}",
+                        call_info.get("from_number"),
+                        call_info.get("to_number"),
+                        call_info.get("forwarded_from"),
+                    )
+                public_base_url = os.getenv("PUBLIC_BASE_URL") or str(request.base_url)
+                twiml = tenant_runtime.build_twilio_stream_twiml(public_base_url, form)
+                return HTMLResponse(content=twiml, media_type="application/xml")
+
+            existing.add(("/", ("POST",)))
+        attached = 0
+        for route in onboarding_api.app.routes:
+            path = getattr(route, "path", "")
+            methods = tuple(sorted(getattr(route, "methods", []) or []))
+            if not path.startswith("/api/") or (path, methods) in existing:
+                continue
+            runner_app.router.routes.append(route)
+            existing.add((path, methods))
+            attached += 1
+        logger.info("Onboarding API: attached {} /api routes to voice worker", attached)
+    except Exception as exc:
+        logger.warning("Onboarding API: route attachment skipped ({})", type(exc).__name__)
+
+
+def _voice_llm_provider() -> str:
+    """Return the configured live voice provider."""
+    return os.getenv("VOICE_LLM_PROVIDER", "nemotron").strip().lower()
 
 
 # ─── Local SmallWebRTC fix: advertise a loopback ICE candidate ───────────────
@@ -131,12 +214,24 @@ async def get_call_info(call_sid: str) -> dict:
     url = f"https://api.twilio.com/2010-04-01/Accounts/{account_sid}/Calls/{call_sid}.json"
     try:
         async with aiohttp.ClientSession() as session:
-            async with session.get(url, auth=aiohttp.BasicAuth(account_sid, auth_token)) as resp:
-                if resp.status != 200:
-                    logger.error(f"Twilio API error ({resp.status}): {await resp.text()}")
-                    return {}
-                data = await resp.json()
-                return {"from_number": data.get("from"), "to_number": data.get("to")}
+            for attempt in range(4):
+                async with session.get(url, auth=aiohttp.BasicAuth(account_sid, auth_token)) as resp:
+                    if resp.status == 404 and attempt < 3:
+                        # A forwarded call can open its media stream before the
+                        # REST record is queryable. Keep caller ID enrichment
+                        # best-effort without delaying ordinary calls much.
+                        await asyncio.sleep(0.25 * (attempt + 1))
+                        continue
+                    if resp.status != 200:
+                        logger.error(f"Twilio API error ({resp.status}): {await resp.text()}")
+                        return {}
+                    data = await resp.json()
+                    return {
+                        "from_number": data.get("from"),
+                        "to_number": data.get("to"),
+                        "forwarded_from": data.get("forwarded_from"),
+                    }
+            return {}
     except Exception as exc:
         logger.error(f"Error fetching Twilio call info: {exc}")
         return {}
@@ -149,8 +244,9 @@ async def _send_owner_sms(call_state: CallState, body: str) -> None:
     """Fire-and-forget Twilio SMS to the owner. Called by finish_voicemail."""
     account_sid = os.getenv("TWILIO_ACCOUNT_SID")
     auth_token = os.getenv("TWILIO_AUTH_TOKEN")
-    owner_number = os.getenv("OWNER_PHONE_NUMBER")
-    twilio_number = os.getenv("TWILIO_PHONE_NUMBER")
+    tenant_runtime = call_state.get("tenant_runtime") or {}
+    owner_number = tenant_runtime.get("owner_phone") or os.getenv("OWNER_PHONE_NUMBER")
+    twilio_number = tenant_runtime.get("agent_phone") or os.getenv("TWILIO_PHONE_NUMBER")
 
     if not all([account_sid, auth_token, owner_number, twilio_number]):
         logger.warning("Twilio SMS not configured — skipping owner notification")
@@ -194,7 +290,11 @@ async def _send_owner_email(call_state: CallState, subject: str, body: str) -> N
     if body:
         call_state["voicemail"]["summary"] = body
     try:
-        action = await asyncio.to_thread(actions.deliver_owner_email, call_state, subject)
+        action = await asyncio.to_thread(
+            actions.deliver_owner_email,
+            cast(dict[str, Any], call_state),
+            subject,
+        )
         if action.get("status") == "sent":
             logger.info(f"Owner email sent: {action.get('subject')!r}")
         elif action.get("status") != "already_sent":
@@ -206,7 +306,7 @@ async def _send_owner_email(call_state: CallState, subject: str, body: str) -> N
 # ─── Voice ID resolution — owner clone with consent guard ────────────────────
 
 
-def _resolve_voice_id() -> str:
+def _resolve_voice_id(tenant_runtime: dict[str, Any] | None = None) -> str:
     """Return the voice ID to use for TTS.
 
     Priority:
@@ -222,11 +322,18 @@ def _resolve_voice_id() -> str:
     NEVER set GRADIUM_CLONED_VOICE_ID to a caller's voice — only the owner
     records the sample and provides consent.
     """
-    cloned_id = os.getenv("GRADIUM_CLONED_VOICE_ID", "").strip()
-    consent = os.getenv("OWNER_VOICE_CONSENT", "false").strip().lower() == "true"
+    tenant_runtime = tenant_runtime or {}
+    tenant_cloned_id = str(tenant_runtime.get("voice_clone_id") or "").strip()
+    tenant_consent = bool(tenant_runtime.get("voice_clone_consent"))
+    cloned_id = tenant_cloned_id or os.getenv("GRADIUM_CLONED_VOICE_ID", "").strip()
+    consent = (
+        tenant_consent
+        if tenant_cloned_id
+        else os.getenv("OWNER_VOICE_CONSENT", "false").strip().lower() == "true"
+    )
 
     if cloned_id and consent:
-        logger.info("TTS: using owner's cloned voice (id=%s)", cloned_id)
+        logger.info("TTS: using owner's consented cloned voice")
         return cloned_id
 
     if cloned_id and not consent:
@@ -238,6 +345,198 @@ def _resolve_voice_id() -> str:
     default_id = os.getenv("GRADIUM_VOICE_ID", "Eu9iL_CYe8N-Gkx_")
     logger.info("TTS: using default Gradium voice (id=%s)", default_id)
     return default_id
+
+
+def _tenant_runtime_for_call(
+    to_number: str | None,
+    forwarded_from: str | None = None,
+) -> dict[str, Any]:
+    """Resolve a tenant from a dedicated number or shared forwarded call."""
+    return tenant_runtime.resolve_for_call(to_number, forwarded_from=forwarded_from)
+
+
+def _gradium_tts_json_config() -> str:
+    """Return advanced Gradium TTS controls as the setup ``json_config`` string.
+
+    Gradium's Studio speed slider reads naturally ("faster" to the right), but
+    the wire-level ``padding_bonus`` uses the opposite sign: negative is faster.
+    Keep the environment variable wire-native so logs and deploy config match
+    Gradium's API documentation exactly.
+    """
+    controls = {
+        "padding_bonus": (
+            "GRADIUM_TTS_PADDING_BONUS",
+            0.0,
+            -4.0,
+            4.0,
+        ),
+        "temp": ("GRADIUM_TTS_TEMP", 0.7, 0.0, 1.4),
+        "cfg_coef": ("GRADIUM_TTS_CFG_COEF", 2.0, 1.0, 4.0),
+    }
+    config: dict[str, float] = {}
+    for key, (env_name, default, minimum, maximum) in controls.items():
+        raw = os.getenv(env_name, str(default)).strip()
+        try:
+            value = float(raw)
+        except ValueError as exc:
+            raise ValueError(f"{env_name} must be a number, got {raw!r}") from exc
+        if not minimum <= value <= maximum:
+            raise ValueError(f"{env_name} must be between {minimum} and {maximum}")
+        config[key] = value
+    logger.info(
+        "TTS: Gradium tuning padding_bonus={} temp={} cfg_coef={}",
+        config["padding_bonus"],
+        config["temp"],
+        config["cfg_coef"],
+    )
+    return json.dumps(config)
+
+
+# ─── Adaptive speaking pace — mirror the caller, calm the rushed ─────────────
+
+
+def _make_tts_pace_controller(tts: Any) -> Any:
+    """Passthrough processor that adapts Gradium's speaking pace to the caller.
+
+    The configured ``padding_bonus`` (env) is the baseline/quick pace. When the
+    caller's inferred tone is ``rushed`` or ``upset`` (talking fast / agitated),
+    the agent eases to a slightly SLOWER pace as a calming effect; when they're
+    calm again it returns to baseline — so it broadly mirrors the caller while
+    de-escalating urgency.
+
+    Gradium's pace lives in ``json_config`` (sent at connect), so a change needs
+    a websocket reconnect. We only reconnect BETWEEN turns — on
+    ``TTSStoppedFrame``, when the socket is idle — so we never clip live speech.
+    The tone is fed in via ``note_tone`` from the transcript tone listener.
+    """
+    try:
+        _baseline = float(json.loads(getattr(tts, "_json_config", None) or "{}").get(
+            "padding_bonus", 0.0
+        ))
+    except Exception:
+        _baseline = 0.0
+    # Calming = slower than baseline (toward 0/positive on Gradium's scale).
+    _calming = max(-4.0, min(4.0, _baseline + 2.5))
+    _CALMING_TONES = {"rushed", "upset"}
+
+    class _TtsPaceController(FrameProcessor):
+        def __init__(self) -> None:
+            super().__init__()
+            self._current = _baseline
+            self._pending = _baseline
+
+        def note_tone(self, tone: str | None) -> None:
+            """Set the target pace from the latest inferred caller tone."""
+            self._pending = _calming if tone in _CALMING_TONES else _baseline
+
+        async def _apply_pending(self) -> None:
+            if self._pending == self._current:
+                return
+            target = self._pending
+            try:
+                cfg = json.loads(getattr(tts, "_json_config", None) or "{}")
+                cfg["padding_bonus"] = target
+                tts._json_config = json.dumps(cfg)
+                await tts._disconnect()
+                await tts._connect()
+                self._current = target
+                logger.info(
+                    "TTS pace adapted -> padding_bonus=%s (%s)",
+                    target,
+                    "calming" if target == _calming else "baseline",
+                )
+            except Exception as exc:  # never destabilise the call over pacing
+                logger.warning(f"TTS pace adapt skipped: {exc}")
+
+        async def process_frame(self, frame: Any, direction: FrameDirection) -> None:
+            await super().process_frame(frame, direction)
+            # Reconnect only when a turn just finished (socket idle).
+            if isinstance(frame, TTSStoppedFrame):
+                await self._apply_pending()
+            await self.push_frame(frame, direction)
+
+    return _TtsPaceController()
+
+
+# ─── Cascade STT — proper-noun-aware speech recognition ──────────────────────
+
+
+def _build_stt_prompt(call_state: "CallState | None" = None) -> str:
+    """Build a short proper-noun prompt to bias gpt-4o-transcribe recognition.
+
+    Whisper/gpt-4o-transcribe accept a free-text ``prompt`` that strongly biases
+    transcription toward the spelled-out terms it contains (it only attends to the
+    last ~224 tokens, so keep this tight). This is what fixes the agent mishearing
+    proper nouns like "Stanford waitlist" or odd common words like "grape".
+
+    Sources, in priority order:
+      1. ``STT_EXTRA_TERMS`` env (comma-separated owner-specific vocab).
+      2. The owner's name (``OWNER_NAME``) and the recognised caller name.
+    Contacts are intentionally NOT bulk-dumped here — that would blow the token
+    budget and dilute the bias.
+    """
+    terms: list[str] = []
+    extra = os.getenv("STT_EXTRA_TERMS", "").strip()
+    if extra:
+        terms.extend(t.strip() for t in extra.split(",") if t.strip())
+    owner = os.getenv("OWNER_NAME", "").strip()
+    if owner:
+        terms.append(owner)
+    if call_state is not None:
+        snap = call_state.get("caller_snapshot") or {}
+        caller_name = snap.get("caller_name")
+        if caller_name:
+            terms.append(str(caller_name))
+
+    seen: set[str] = set()
+    uniq: list[str] = []
+    for t in terms:
+        key = t.lower()
+        if key and key not in seen:
+            seen.add(key)
+            uniq.append(t)
+    if not uniq:
+        return ""
+    return "The caller may mention these names and terms: " + ", ".join(uniq) + "."
+
+
+def _build_cascade_stt(call_state: "CallState | None" = None):
+    """Construct the cascade STT engine from ``STT_PROVIDER``.
+
+    Default ``openai`` uses gpt-4o-transcribe with a proper-noun prompt bias —
+    markedly better than the previous Gradium default at names and unusual words.
+    ``gradium`` and ``nvidia`` remain available for A/B testing.
+    """
+    provider = os.getenv("STT_PROVIDER", "openai").strip().lower()
+
+    if provider == "gradium":
+        logger.info("STT: Gradium (streaming)")
+        return GradiumSTTService(
+            api_key=os.environ["GRADIUM_API_KEY"],
+            settings=GradiumSTTService.Settings(language=Language.EN),
+        )
+
+    if provider == "nvidia":
+        from nvidia_stt import NVidiaWebSocketSTTService
+
+        logger.info("STT: NVIDIA Parakeet (streaming)")
+        return NVidiaWebSocketSTTService(url=os.environ["NVIDIA_ASR_URL"])
+
+    if provider != "openai":
+        logger.warning("STT: unknown STT_PROVIDER=%r — falling back to openai", provider)
+
+    model = os.getenv("STT_MODEL", "gpt-4o-transcribe")
+    prompt = _build_stt_prompt(call_state)
+    logger.info("STT: OpenAI %s (prompt=%d chars of proper-noun bias)", model, len(prompt))
+    return OpenAISTTService(
+        api_key=os.environ["OPENAI_API_KEY"],
+        settings=OpenAISTTService.Settings(
+            model=model,
+            language=Language.EN,
+            prompt=prompt or None,
+            temperature=0.0,
+        ),
+    )
 
 
 # ─── Triage oracle — thinking-enabled urgency assessment ─────────────────────
@@ -448,6 +747,8 @@ def _make_call_end_detector(
 async def run_bot(
     transport: BaseTransport,
     from_number: str | None = None,
+    to_number: str | None = None,
+    forwarded_from: str | None = None,
     audio_in_sample_rate: int = 16000,
     audio_out_sample_rate: int = 24000,
 ) -> None:
@@ -455,19 +756,42 @@ async def run_bot(
 
     Args:
         transport: SmallWebRTC (local) or FastAPIWebsocket (Twilio).
-        from_number: E.164 caller number from Twilio, or None for WebRTC.
-        audio_in_sample_rate: 16 kHz (WebRTC) or 8 kHz (Twilio mulaw).
+    from_number: E.164 caller number from Twilio, or None for WebRTC.
+    to_number: E.164 Twilio number reached by the caller, used for tenant routing.
+    forwarded_from: Original owner number when the call was conditionally forwarded.
+    audio_in_sample_rate: 16 kHz (WebRTC) or 8 kHz (Twilio mulaw).
         audio_out_sample_rate: 24 kHz (WebRTC) or 8 kHz (Twilio mulaw).
     """
     logger.info("Starting voicemail bot")
 
+    voice_llm_provider = _voice_llm_provider()
+    use_openai_realtime = voice_llm_provider == "openai-realtime"
+    if use_openai_realtime:
+        # OpenAI Realtime consumes 24 kHz PCM input directly. Its response stays
+        # text-only so Gradium can speak through the owner's configured clone.
+        audio_in_sample_rate = 24000
+        logger.info(
+            "Voice LLM: OpenAI Realtime text model={} + Gradium TTS",
+            os.getenv("OPENAI_REALTIME_MODEL", "gpt-realtime-2"),
+        )
+    elif voice_llm_provider != "nemotron":
+        raise ValueError(
+            f"Unsupported VOICE_LLM_PROVIDER={voice_llm_provider!r}; "
+            "expected 'nemotron' or 'openai-realtime'"
+        )
+
     # One CallState per call — closed over by all P1 tool closures below.
     call_state = default_call_state(caller_number=from_number or "")
+    tenant_runtime = _tenant_runtime_for_call(to_number, forwarded_from=forwarded_from)
+    call_state["tenant_runtime"] = tenant_runtime
     web_demo = not (from_number or "").strip()
     recognized_caller_name = persona_tools.greeting_for_caller(call_state)
 
     # Thinking mode: controls the triage oracle only. Pipeline LLM is always off.
-    enable_thinking = os.getenv("NEMOTRON_ENABLE_THINKING", "false").lower() == "true"
+    enable_thinking = (
+        not use_openai_realtime
+        and os.getenv("NEMOTRON_ENABLE_THINKING", "false").lower() == "true"
+    )
     if enable_thinking:
         logger.info("Thinking mode enabled — triage oracle will use Nemotron reasoning")
 
@@ -489,7 +813,10 @@ async def run_bot(
 
         persona_tools.sync_voicemail_to_snapshot(call_state)
         try:
-            email_action = await asyncio.to_thread(actions.deliver_owner_email, call_state)
+            email_action = await asyncio.to_thread(
+                actions.deliver_owner_email,
+                cast(dict[str, Any], call_state),
+            )
             if email_action.get("status") == "sent":
                 logger.info("Call finalize: owner email delivered")
             elif email_action.get("status") == "queued":
@@ -853,11 +1180,30 @@ async def run_bot(
     all_tools = p1_tools + [bind_call_state(fn) for fn in TOOL_REGISTRY]
 
     # ── P2: inject persona_context before building system instruction ──────────
-    from owner_config import build_persona_context
+    if tenant_runtime:
+        call_state["persona_context"] = tenant_store.build_persona_context(tenant_runtime)
+    else:
+        from owner_config import build_persona_context
 
-    call_state["persona_context"] = build_persona_context()
+        call_state["persona_context"] = build_persona_context()
 
-    system_instruction = build_system_instruction(call_state, caller_name=recognized_caller_name)
+    # Assistant mode: the live speaker is the owner (testing / calling their own
+    # agent), not an inbound stranger — same signal owner_tools uses to authorize
+    # private reads. When true, the agent is told it has direct account access so
+    # it stops screening the owner like a caller (e.g. "I don't have calendar access").
+    _owner_number = str(
+        tenant_runtime.get("owner_phone") or os.getenv("OWNER_PHONE_NUMBER", "")
+    ).strip()
+    if tenant_runtime:
+        assistant_mode = bool(_owner_number) and (from_number or "").strip() == _owner_number
+    else:
+        assistant_mode = (
+            os.getenv("ASSISTANT_MODE", "").strip().lower() in ("1", "true", "yes")
+            or (bool(_owner_number) and (from_number or "").strip() == _owner_number)
+        )
+    system_instruction = build_system_instruction(
+        call_state, caller_name=recognized_caller_name, assistant_mode=assistant_mode
+    )
 
     # P2 (Part A/B): layer the owner's LIVE private context on top of the
     # owner_config baseline — curated notes plus summaries derived from real
@@ -867,41 +1213,109 @@ async def run_bot(
     # until persona_context.md is populated.
     from persona_context import load_persona_context
 
-    persona = load_persona_context()
+    persona = "" if tenant_runtime else load_persona_context()
     if persona:
         system_instruction += "\n\n" + persona
 
     # ── Services ──────────────────────────────────────────────────────────────
-    stt = GradiumSTTService(
-        api_key=os.environ["GRADIUM_API_KEY"],
-        settings=GradiumSTTService.Settings(
-            language=Language.EN,
-        ),
-    )
+    if use_openai_realtime:
+        stt = None
+        realtime_vad_eagerness = os.getenv("OPENAI_REALTIME_VAD_EAGERNESS", "high")
+        if realtime_vad_eagerness not in ("low", "medium", "high", "auto"):
+            raise ValueError(
+                "OPENAI_REALTIME_VAD_EAGERNESS must be one of: low, medium, high, auto"
+            )
+        llm = OpenAIRealtimeLLMService(
+            api_key=os.environ["OPENAI_API_KEY"],
+            settings=OpenAIRealtimeLLMService.Settings(
+                model=os.getenv("OPENAI_REALTIME_MODEL", "gpt-realtime-2"),
+                system_instruction=system_instruction,
+                session_properties=SessionProperties(
+                    # Keep Realtime's low-latency audio input and semantic VAD,
+                    # but synthesize its streamed text with the owner's Gradium
+                    # clone instead of an OpenAI built-in voice.
+                    output_modalities=["text"],
+                    audio=AudioConfiguration(
+                        input=AudioInput(
+                            # Suppress background / far-field voices (e.g. someone
+                            # talking in the room) so the agent isn't derailed by
+                            # speech that isn't the caller right at the mic.
+                            noise_reduction=InputAudioNoiseReduction(type="near_field"),
+                            transcription=InputAudioTranscription(
+                                model=os.getenv(
+                                    "OPENAI_REALTIME_TRANSCRIPTION_MODEL",
+                                    "gpt-realtime-whisper",
+                                ),
+                                language="en",
+                                # Proper-noun bias (Stanford, names, etc.) so the
+                                # Realtime transcript stops mangling words like
+                                # "Stanford waitlist"/"grape". gpt-4o-transcribe
+                                # honors this best (set it as the model above).
+                                prompt=_build_stt_prompt(call_state) or None,
+                            ),
+                            turn_detection=SemanticTurnDetection(
+                                eagerness=cast(Any, realtime_vad_eagerness)
+                            ),
+                        ),
+                    ),
+                    reasoning=Reasoning(
+                        effort=os.getenv("OPENAI_REALTIME_REASONING_EFFORT", "minimal")
+                    ),
+                ),
+            ),
+        )
+    else:
+        stt = _build_cascade_stt(call_state)
 
-    llm = VLLMOpenAILLMService(
-        api_key=os.getenv("NEMOTRON_LLM_API_KEY", "EMPTY"),
-        base_url=os.getenv("NEMOTRON_LLM_URL", "http://192.168.7.228:8000/v1"),
-        settings=VLLMOpenAILLMService.Settings(
-            model=os.getenv("NEMOTRON_LLM_MODEL", "nvidia/nemotron-3-super"),
-            system_instruction=system_instruction,
-            # Pipeline LLM: thinking always OFF. Reasoning tokens can bleed into
-            # TTS if the vLLM server has no --reasoning-parser configured.
-            # Thinking is used only by the background triage oracle.
-            extra={"extra_body": {"chat_template_kwargs": {"enable_thinking": False}}},
-        ),
-    )
+        llm = VLLMOpenAILLMService(
+            api_key=os.getenv("NEMOTRON_LLM_API_KEY", "EMPTY"),
+            base_url=os.getenv("NEMOTRON_LLM_URL", "http://192.168.7.228:8000/v1"),
+            settings=VLLMOpenAILLMService.Settings(
+                model=os.getenv("NEMOTRON_LLM_MODEL", "nvidia/nemotron-3-super"),
+                system_instruction=system_instruction,
+                # Pipeline LLM: thinking always OFF. Reasoning tokens can bleed into
+                # TTS if the vLLM server has no --reasoning-parser configured.
+                # Thinking is used only by the background triage oracle.
+                extra={"extra_body": {"chat_template_kwargs": {"enable_thinking": False}}},
+            ),
+        )
 
     tts = GradiumTTSService(
         api_key=os.environ["GRADIUM_API_KEY"],
+        json_config=_gradium_tts_json_config(),
         settings=GradiumTTSService.Settings(
-            voice=_resolve_voice_id(),
+            voice=_resolve_voice_id(tenant_runtime),
         ),
     )
 
     tools = ToolsSchema(standard_tools=all_tools)
     for fn in all_tools:
         llm.register_direct_function(fn)
+
+    # ── "One moment" filler before slow tool calls ───────────────────────────
+    # Account/network/osascript lookups take ~0.5–4.5s. Speak a short filler the
+    # instant such a tool starts so the caller hears the agent is working instead
+    # of dead air. Instant tools (capture_*, snapshot) are excluded — no filler.
+    _SLOW_TOOLS = {
+        "check_owner_calendar",
+        "check_owner_inbox",
+        "check_github",
+        "list_reminders",
+        "add_reminder",
+        "get_calendar_context_for_caller",
+        "book_callback_slot",
+        "send_owner_email",
+    }
+
+    @llm.event_handler("on_function_calls_started")
+    async def _speak_filler_on_slow_tool(service, function_calls):
+        try:
+            if any(
+                getattr(fc, "function_name", "") in _SLOW_TOOLS for fc in function_calls
+            ):
+                await service.push_frame(TTSSpeakFrame("One moment."))
+        except Exception as exc:  # never let a filler break the call
+            logger.warning(f"filler-on-tool failed: {exc}")
 
     context = LLMContext(tools=tools)
     # Turn-taking: use Pipecat's default stop strategy (LocalSmartTurnAnalyzerV3),
@@ -915,28 +1329,46 @@ async def run_bot(
     user_aggregator, assistant_aggregator = LLMContextAggregatorPair(
         context,
         user_params=LLMUserAggregatorParams(
-            vad_analyzer=SileroVADAnalyzer(),
+            # OpenAI Realtime uses server-side semantic VAD and requires
+            # 24 kHz input. Silero only accepts 8/16 kHz, so keep local VAD on
+            # the cascade path and let Realtime own turn detection end-to-end.
+            vad_analyzer=None if use_openai_realtime else SileroVADAnalyzer(),
         ),
     )
 
     # P3 — passthrough processor that infers caller tone from final transcripts
-    # (no LLM round-trip). Sits between stt and the user aggregator.
-    tone_listener = persona_tools.make_transcript_tone_processor(call_state, context)
+    # (no LLM round-trip). Placement differs because Realtime emits transcripts
+    # upstream from the LLM while the cascade STT emits them downstream.
+    # Adaptive speaking pace: the tone listener feeds the caller's inferred tone
+    # to the pace controller, which slows the agent for rushed/upset callers.
+    pace_controller = _make_tts_pace_controller(tts)
+    tone_listener = persona_tools.make_transcript_tone_processor(
+        call_state, context, pace_cb=pace_controller.note_tone
+    )
     call_end_detector = _make_call_end_detector(call_state, _hangup)
 
-    pipeline = Pipeline(
+    pipeline_processors = [transport.input()]
+    if use_openai_realtime:
+        # Realtime sends final caller transcription frames upstream from the LLM
+        # service. Observe them before the user aggregator consumes them.
+        pipeline_processors.append(user_aggregator)
+    else:
+        assert stt is not None
+        pipeline_processors.append(stt)
+    pipeline_processors.extend([tone_listener, call_end_detector])
+    if not use_openai_realtime:
+        pipeline_processors.append(user_aggregator)
+    pipeline_processors.append(llm)
+    pipeline_processors.append(tts)
+    # Observe TTSStarted/Stopped just downstream of TTS to retune pace between turns.
+    pipeline_processors.append(pace_controller)
+    pipeline_processors.extend(
         [
-            transport.input(),
-            stt,
-            tone_listener,
-            call_end_detector,
-            user_aggregator,
-            llm,
-            tts,
             transport.output(),
             assistant_aggregator,
         ]
     )
+    pipeline = Pipeline(pipeline_processors)
 
     worker = PipelineWorker(
         pipeline,
@@ -963,9 +1395,11 @@ async def run_bot(
         logger.info("Client connected")
         persona_tools.refresh_live_style_directive(call_state, context)
         opener = (
-            f"A caller just connected. Contact lookup suggests this is {recognized_caller_name}. "
-            "Greet them by name, confirm briefly, then offer to take a message or help "
-            "with a quick question."
+            f"A caller just connected. Their number is in the owner's contacts — this is "
+            f"{recognized_caller_name}. Greet them BY NAME right away and warmly (e.g. "
+            f"\"Hey {recognized_caller_name}!\"). Do NOT ask who's calling or ask them to "
+            "confirm their name — you already know them. Then offer to take a message or "
+            "help with a quick question."
             if recognized_caller_name
             else "A caller just connected. Greet them and offer to take a message or help "
                  "with a quick question."
@@ -981,6 +1415,11 @@ async def run_bot(
     @transport.event_handler("on_client_disconnected")
     async def on_client_disconnected(transport, client):
         logger.info(f"Client disconnected — call_state summary: {call_state['voicemail']}")
+        if use_openai_realtime:
+            # Realtime can still be dispatching final tool calls after Twilio
+            # closes its media websocket. Give those structured captures a brief
+            # chance to land before persistence snapshots call_state.
+            await asyncio.sleep(1.0)
         await _finalize_call("disconnect")
 
         # ── Cekura Observability (fire-and-forget, never raises) ───────────────
@@ -1008,6 +1447,8 @@ async def run_bot(
 async def bot(runner_args: RunnerArguments):
     """Pipecat entry point — routes WebRTC vs Twilio transports."""
     from_number: str | None = None
+    to_number: str | None = None
+    forwarded_from: str | None = None
     transport_overrides: dict = {}
 
     if os.environ.get("ENV") != "local":
@@ -1048,10 +1489,15 @@ async def bot(runner_args: RunnerArguments):
             transport_overrides["audio_out_sample_rate"] = 8000
 
             _, call_data = await parse_telephony_websocket(runner_args.websocket)
-            call_info = await get_call_info(call_data["call_id"])
+            call_info = tenant_runtime.call_info_from_twilio_parameters(call_data.get("body"))
+            if not all([call_info.get("from_number"), call_info.get("to_number"), call_info.get("forwarded_from")]):
+                rest_call_info = await get_call_info(call_data["call_id"])
+                call_info = {**rest_call_info, **call_info}
             if call_info:
                 from_number = call_info.get("from_number")
-                logger.info(f"Call from {from_number} to {call_info.get('to_number')}")
+                to_number = call_info.get("to_number")
+                forwarded_from = call_info.get("forwarded_from")
+                logger.info(f"Call from {from_number} to {to_number} forwarded_from={forwarded_from}")
 
             serializer = TwilioFrameSerializer(
                 stream_sid=call_data["stream_id"],
@@ -1073,10 +1519,17 @@ async def bot(runner_args: RunnerArguments):
             logger.error(f"Unsupported runner type: {type(runner_args)}")
             return
 
-    await run_bot(transport, from_number=from_number, **transport_overrides)
+    await run_bot(
+        transport,
+        from_number=from_number,
+        to_number=to_number,
+        forwarded_from=forwarded_from,
+        **transport_overrides,
+    )
 
 
 if __name__ == "__main__":
     from pipecat.runner.run import main
 
+    _attach_onboarding_api_to_runner()
     main()

@@ -37,6 +37,7 @@ CLI (for the stage demo):
 
 from __future__ import annotations
 
+import hashlib
 import json
 import os
 import uuid
@@ -277,7 +278,10 @@ def _normalize_number(number: str | None) -> str:
     return cleaned
 
 
-def get_caller_profile(caller_number: str | None) -> dict[str, Any] | None:
+def get_caller_profile(
+    caller_number: str | None,
+    owner_context_tag: str | None = None,
+) -> dict[str, Any] | None:
     """Return the current accumulated profile for a caller, or None if unknown.
 
     Resolved from the newest ``caller_profile`` record for this number. On
@@ -290,13 +294,20 @@ def get_caller_profile(caller_number: str | None) -> dict[str, Any] | None:
         r
         for r in _get_backend().read_all(TYPE_CALLER_PROFILE)
         if _normalize_number(r.get("caller_number")) == key
+        and (
+            owner_context_tag is None
+            or str(r.get("owner_context_tag") or "") == owner_context_tag
+        )
     ]
     if not matches:
         return None
     return max(matches, key=lambda r: r.get("timestamp", ""))
 
 
-def list_calls_for_caller(caller_number: str | None) -> list[dict[str, Any]]:
+def list_calls_for_caller(
+    caller_number: str | None,
+    owner_context_tag: str | None = None,
+) -> list[dict[str, Any]]:
     """Every voicemail record left by this caller, newest first."""
     key = _normalize_number(caller_number)
     if not key:
@@ -308,6 +319,10 @@ def list_calls_for_caller(caller_number: str | None) -> list[dict[str, Any]]:
             r.get("caller_number") or (r.get("voicemail") or {}).get("caller_number")
         )
         == key
+        and (
+            owner_context_tag is None
+            or str(r.get("owner_context_tag") or "") == owner_context_tag
+        )
     ]
     calls.sort(key=lambda r: r.get("timestamp", ""), reverse=True)
     return calls
@@ -323,6 +338,7 @@ def upsert_caller_profile(
     summary: str | None = None,
     persona_id: str | None = None,
     call_record_id: str | None = None,
+    owner_context_tag: str | None = None,
 ) -> dict[str, Any] | None:
     """Create or expand the per-caller profile at end of call.
 
@@ -340,7 +356,12 @@ def upsert_caller_profile(
         return None
 
     now = _now_iso()
-    prior = get_caller_profile(key) or {}
+    prior = get_caller_profile(key, owner_context_tag=owner_context_tag) or {}
+    owner_key = owner_context_tag or ""
+    stable_key = key
+    if owner_key:
+        owner_digest = hashlib.sha256(owner_key.encode("utf-8")).hexdigest()[:16]
+        stable_key = f"caller-profile:{owner_digest}:{key}"
 
     def _append_unique(seq: Any, value: Any, cap: int = 50) -> list[Any]:
         out = list(seq or [])
@@ -355,9 +376,10 @@ def upsert_caller_profile(
         return out[-cap:]
 
     profile = {
-        "record_id": key,  # stable key → DynamoDB upserts in place
+        "record_id": stable_key,  # stable per-owner key -> DynamoDB upserts in place
         "type": TYPE_CALLER_PROFILE,
         "caller_number": key,
+        "owner_context_tag": owner_key,
         "timestamp": now,  # last updated
         "first_seen": prior.get("first_seen") or now,
         "last_seen": now,
