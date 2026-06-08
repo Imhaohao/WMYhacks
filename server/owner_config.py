@@ -22,6 +22,19 @@ DEFAULT: dict[str, Any] = {
     "message_context_summary": "",
     "message_context_source": "manual",  # "manual" | "imessage"
     "message_context_synced_at": "",      # ISO-8601 UTC, set on auto-sync only
+    # Public onboarding stores only safe, owner-authored metadata here. The
+    # cloned voice ID remains in .env.local so it never leaks through the API.
+    "voicemail_forwarding_confirmed": False,
+    "voice_clone_name": "",
+    "voice_clone_status": "not_started",
+    "voice_clone_updated_at": "",
+    # Derived, privacy-bounded owner diction. Raw onboarding replies are never
+    # stored; only short recurring snippets and coarse style notes survive.
+    "diction_examples": "",
+    "diction_profile_phrases": [],
+    "diction_profile_style_notes": [],
+    "diction_profile_lines": [],
+    "diction_profile_updated_at": "",
 }
 
 # Soft cap on the total persona_context string injected into the system prompt.
@@ -71,6 +84,20 @@ def build_persona_context() -> str:
             else "Recent context (owner-provided summary):"
         )
         parts.append(f"{prefix} {summary}")
+    diction_lines = cfg.get("diction_profile_lines") or []
+    if isinstance(diction_lines, list) and diction_lines:
+        clean_lines = [str(line).strip() for line in diction_lines if str(line).strip()]
+        if clean_lines:
+            parts.append("Owner diction profile:\n" + "\n".join(clean_lines))
+    else:
+        # Compatibility for existing single-owner configs written before the
+        # derived onboarding profile shipped.
+        diction = str(cfg.get("diction_examples") or "").strip()
+        if diction:
+            parts.append(
+                "Owner diction examples: "
+                f"{diction}. Mirror this phrasing lightly and naturally; do not force slang."
+            )
     email = (cfg.get("owner_email") or "").strip()
     if email:
         parts.append(f"After the call, email summaries go to {email}.")
