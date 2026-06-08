@@ -36,6 +36,7 @@ export function PhoneCallExperience({
   agentName: string
   phone: string
 }) {
+  const avatarInitial = (agentName.match(/[A-Za-z]/)?.[0] ?? "G").toUpperCase()
   const [status, setStatus] = useState<CallStatus>("idle")
   const [muted, setMuted] = useState(false)
   const [botLevel, setBotLevel] = useState(0)
@@ -185,11 +186,11 @@ export function PhoneCallExperience({
             />
           )}
           <div
-            className={`relative flex size-24 items-center justify-center rounded-full bg-white/10 text-4xl backdrop-blur ${
+            className={`relative flex size-24 items-center justify-center rounded-full bg-white/10 text-4xl font-semibold backdrop-blur ${
               status === "idle" ? "animate-pulse" : ""
             }`}
           >
-            🌷
+            {avatarInitial}
           </div>
         </div>
         <p className="text-xl font-semibold">{agentName}</p>

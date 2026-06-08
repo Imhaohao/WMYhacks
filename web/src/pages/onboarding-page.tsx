@@ -332,7 +332,11 @@ export function OnboardingPage() {
       )
       setDraft((current) => mergeTenantAgent(current, agent))
       if (phone_assignment.assigned) {
-        setNotice("Your forwarding number is assigned. Finish by enabling conditional forwarding.")
+        setNotice(
+          agent.activation_status === "ready"
+            ? "Your agent is active."
+            : "Your forwarding number is assigned. Enable conditional forwarding and confirm it before the agent is ready.",
+        )
       } else {
         setError(
           phone_assignment.detail ||
@@ -513,6 +517,14 @@ export function OnboardingPage() {
 
   const saveDiction = async () => {
     if (!draft.dictionProfile?.ready) return
+    // Resume case: the profile is already persisted server-side and the raw
+    // replies were intentionally discarded (never restored to dictionSamples).
+    // Re-deriving from fewer than three samples would 422 and trap the user on
+    // this step, so just advance when there are no fresh replies to save.
+    if (dictionSampleCount < 3) {
+      next(4)
+      return
+    }
     setBusy(true)
     setError(null)
     try {
@@ -1098,7 +1110,7 @@ export function OnboardingPage() {
                       : "Your setup draft is ready."}
                 </CardTitle>
                 <CardDescription>
-                  {privateMode || (tenantMode && draft.tenantAgentPhone)
+                  {privateMode || (tenantMode && draft.tenantAgentPhone && draft.forwardingConfirmed)
                     ? "Missed calls now have a familiar, context-aware place to land."
                     : tenantMode
                       ? "Your voice and diction profile are saved. Activate to assign a dedicated forwarding number."
@@ -1108,7 +1120,7 @@ export function OnboardingPage() {
               <CardContent className="space-y-5">
                 <div className="grid gap-3 sm:grid-cols-5">
                   {[
-                    ["Voicemail", draft.forwardingConfirmed ? "Prepared" : "Pending", PhoneCall],
+                    ["Voicemail", draft.forwardingConfirmed ? "Connected" : "Pending", PhoneCall],
                     ["Voice", draft.voiceSampleReady ? "Prepared" : "Pending", Sparkles],
                     ["Diction", draft.dictionProfile?.ready ? "Prepared" : "Pending", ShieldCheck],
                     ["Gmail", draft.gmailConnectedEmail ? "Connected" : "Optional", Mail],
@@ -1165,8 +1177,10 @@ export function OnboardingPage() {
                   {privateMode
                     ? "Your live owner settings are saved. Open the demo call to hear the agent."
                     : tenantMode
-                      ? draft.tenantAgentPhone
-                        ? "Your private cloud agent is provisioned. Calls to the forwarding number route into your own voice, diction, and tenant context."
+                      ? draft.tenantAgentPhone && draft.forwardingConfirmed
+                        ? "Your private cloud agent is ready. Missed calls forwarded to the destination above route into your own voice, diction, and tenant context."
+                        : draft.tenantAgentPhone
+                          ? "Your private cloud agent is provisioned, but voicemail is not connected until conditional forwarding is enabled and confirmed."
                         : "Your private cloud profile is saved. Activate it to provision the dedicated forwarding number."
                     : "This preview deliberately stops before live activation. A production rollout needs authenticated per-user provisioning so one visitor can never overwrite another person’s agent."}
                 </div>
