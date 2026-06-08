@@ -21,7 +21,7 @@ export function LandingPage() {
           Upload contacts, set your notify channels, and talk to your agent in the browser.
         </p>
         <Button asChild size="lg" className="mt-8">
-          <Link to="/setup">Create your account</Link>
+          <Link to="/onboarding">Create your account</Link>
         </Button>
       </section>
     </div>

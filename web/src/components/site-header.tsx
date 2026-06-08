@@ -14,7 +14,7 @@ export function SiteHeader() {
             <Link to="/try">Try call</Link>
           </Button>
           <Button asChild size="sm">
-            <Link to="/setup">Set up</Link>
+            <Link to="/onboarding">Get started</Link>
           </Button>
         </nav>
       </div>

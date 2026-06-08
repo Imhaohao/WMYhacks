@@ -2,6 +2,12 @@
 
 Owner-facing landing page and setup wizard for the voicemail agent.
 
+The public entry point is `/onboarding`: a streamlined, public-safe flow for
+conditional voicemail forwarding, a consented owner voice sample, and diction
+examples. When `VITE_ONBOARDING_API_URL` is blank, drafts stay in the visitor's
+browser and audio is not uploaded. Set the URL only for a trusted private
+deployment whose backend has `ALLOW_OWNER_PROVISIONING=true`.
+
 ## Run locally
 
 Terminal 1 — onboarding API (port 8787):

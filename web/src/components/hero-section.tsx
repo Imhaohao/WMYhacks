@@ -51,7 +51,7 @@ export function HeroSection() {
         </p>
         <div className="mt-10 flex flex-col items-center justify-center gap-4 sm:flex-row">
           <Button asChild size="lg" className="min-w-[220px]">
-            <Link to="/setup">
+            <Link to="/onboarding">
               Create your free account
               <ArrowRight className="size-4" />
             </Link>

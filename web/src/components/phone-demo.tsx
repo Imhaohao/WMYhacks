@@ -31,7 +31,7 @@ export function PhoneDemo() {
       </div>
 
       <Button asChild size="lg" className="z-10 mt-14">
-        <Link to="/setup">
+        <Link to="/onboarding">
           Claim your number
           <ArrowRight className="size-4" />
         </Link>
