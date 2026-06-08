@@ -1,6 +1,6 @@
 # AGENTS.md
 
-Guidance for AI agents working in this repository (YC Voice Agents Hackathon — Pipecat voice agent).
+Applied Intelligence Hackathon
 
 ## Model Routing (Executive Delegation)
 

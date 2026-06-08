@@ -252,3 +252,6 @@ server/google_token.json
 
 # Gmail OAuth refresh token (never commit)
 server/google_gmail_token.json
+
+# ngrok static domain (local)
+scripts/.ngrok-domain
