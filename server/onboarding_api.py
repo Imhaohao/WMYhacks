@@ -1450,21 +1450,25 @@ def health_check() -> dict:
 
     voice_provider = os.getenv("VOICE_LLM_PROVIDER", "nemotron").strip().lower()
     checks["voice_provider"] = {
-        "ok": voice_provider in ("nemotron", "openai-realtime"),
+        "ok": voice_provider in ("nemotron", "openai-realtime", "elevenlabs"),
         "detail": voice_provider,
     }
-    voice_checks = (
-        [
+    if voice_provider == "openai-realtime":
+        voice_checks = [
             ("openai_realtime", "OPENAI_API_KEY"),
             ("gradium_tts", "GRADIUM_API_KEY"),
         ]
-        if voice_provider == "openai-realtime"
-        else [
+    elif voice_provider == "elevenlabs":
+        voice_checks = [
+            ("elevenlabs_tts", "ELEVENLABS_API_KEY"),
+            ("elevenlabs_voice", "ELEVENLABS_VOICE_ID"),
+        ]
+    else:
+        voice_checks = [
             ("gradium", "GRADIUM_API_KEY"),
             ("nemotron_llm", "NEMOTRON_LLM_URL"),
             ("nemotron_stt", "NVIDIA_ASR_URL"),
         ]
-    )
 
     for key, env_name in [
         *voice_checks,

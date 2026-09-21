@@ -766,6 +766,7 @@ async def run_bot(
 
     voice_llm_provider = _voice_llm_provider()
     use_openai_realtime = voice_llm_provider == "openai-realtime"
+    use_elevenlabs = voice_llm_provider == "elevenlabs"
     if use_openai_realtime:
         # OpenAI Realtime consumes 24 kHz PCM input directly. Its response stays
         # text-only so Gradium can speak through the owner's configured clone.
@@ -774,10 +775,10 @@ async def run_bot(
             "Voice LLM: OpenAI Realtime text model={} + Gradium TTS",
             os.getenv("OPENAI_REALTIME_MODEL", "gpt-realtime-2"),
         )
-    elif voice_llm_provider != "nemotron":
+    elif voice_llm_provider not in ("nemotron", "elevenlabs"):
         raise ValueError(
             f"Unsupported VOICE_LLM_PROVIDER={voice_llm_provider!r}; "
-            "expected 'nemotron' or 'openai-realtime'"
+            "expected 'nemotron', 'openai-realtime' or 'elevenlabs'"
         )
 
     # One CallState per call — closed over by all P1 tool closures below.
@@ -1218,7 +1219,54 @@ async def run_bot(
         system_instruction += "\n\n" + persona
 
     # ── Services ──────────────────────────────────────────────────────────────
-    if use_openai_realtime:
+    convai = None
+    if use_elevenlabs:
+        from elevenlabs_agent import ElevenLabsConvAIService, resolve_voice_id
+
+        _owner_name = os.getenv("OWNER_NAME", "").strip()
+        if recognized_caller_name:
+            _first_message = (
+                f"Hey {recognized_caller_name}, this is {_owner_name}'s assistant. "
+                "What can I do for you?"
+            ) if _owner_name else (
+                f"Hey {recognized_caller_name}, I'm the assistant here. What can I do for you?"
+            )
+        else:
+            _first_message = (
+                f"Hi, this is {_owner_name}'s assistant. {_owner_name} can't pick up right now, "
+                "but I can take a message or help with a quick question."
+            ) if _owner_name else (
+                "Hi, the owner can't pick up right now, but I can take a message or help "
+                "with a quick question."
+            )
+        _asr_keywords = [
+            term.strip()
+            for term in os.getenv("STT_EXTRA_TERMS", "").split(",")
+            if term.strip()
+        ]
+        if _owner_name:
+            _asr_keywords.append(_owner_name)
+        if recognized_caller_name:
+            _asr_keywords.append(recognized_caller_name)
+        async def _elevenlabs_hangup() -> None:
+            # The hosted agent said goodbye and closed its side. End the media
+            # transport so the phone line / browser call actually hangs up.
+            _hangup["ending"] = True
+            await _hang_up_transport(transport)
+
+        convai = ElevenLabsConvAIService(
+            system_prompt=system_instruction,
+            first_message=_first_message,
+            tools=all_tools,
+            voice_id=resolve_voice_id(tenant_runtime),
+            asr_keywords=_asr_keywords,
+            call_state=call_state,
+            hangup_cb=_elevenlabs_hangup,
+        )
+        logger.info("Voice stack: ElevenLabs Conversational AI (flash streaming TTS + managed LLM)")
+        stt = None
+        llm = None
+    elif use_openai_realtime:
         stt = None
         realtime_vad_eagerness = os.getenv("OPENAI_REALTIME_VAD_EAGERNESS", "high")
         if realtime_vad_eagerness not in ("low", "medium", "high", "auto"):
@@ -1280,17 +1328,24 @@ async def run_bot(
             ),
         )
 
-    tts = GradiumTTSService(
-        api_key=os.environ["GRADIUM_API_KEY"],
-        json_config=_gradium_tts_json_config(),
-        settings=GradiumTTSService.Settings(
-            voice=_resolve_voice_id(tenant_runtime),
-        ),
-    )
+    if use_elevenlabs:
+        tts = None
+    else:
+        tts = GradiumTTSService(
+            api_key=os.environ["GRADIUM_API_KEY"],
+            json_config=_gradium_tts_json_config(),
+            settings=GradiumTTSService.Settings(
+                voice=_resolve_voice_id(tenant_runtime),
+            ),
+        )
 
-    tools = ToolsSchema(standard_tools=all_tools)
-    for fn in all_tools:
-        llm.register_direct_function(fn)
+    if not use_elevenlabs:
+        assert llm is not None
+        tools = ToolsSchema(standard_tools=all_tools)
+        for fn in all_tools:
+            llm.register_direct_function(fn)
+    else:
+        tools = None
 
     # ── "One moment" filler before slow tool calls ───────────────────────────
     # Account/network/osascript lookups take ~0.5–4.5s. Speak a short filler the
@@ -1307,17 +1362,22 @@ async def run_bot(
         "send_owner_email",
     }
 
-    @llm.event_handler("on_function_calls_started")
-    async def _speak_filler_on_slow_tool(service, function_calls):
-        try:
-            if any(
-                getattr(fc, "function_name", "") in _SLOW_TOOLS for fc in function_calls
-            ):
-                await service.push_frame(TTSSpeakFrame("One moment."))
-        except Exception as exc:  # never let a filler break the call
-            logger.warning(f"filler-on-tool failed: {exc}")
+    def _tool_call_is_slow(function_calls) -> bool:
+        return any(
+            getattr(fc, "function_name", "") in _SLOW_TOOLS for fc in function_calls
+        )
 
-    context = LLMContext(tools=tools)
+    if llm is not None:
+
+        @llm.event_handler("on_function_calls_started")
+        async def _speak_filler_on_slow_tool(service, function_calls):
+            try:
+                if _tool_call_is_slow(function_calls):
+                    await service.push_frame(TTSSpeakFrame("One moment."))
+            except Exception as exc:  # never let a filler break the call
+                logger.warning(f"filler-on-tool failed: {exc}")
+
+    context = None if use_elevenlabs else LLMContext(tools=cast(Any, tools))
     # Turn-taking: use Pipecat's default stop strategy (LocalSmartTurnAnalyzerV3),
     # a prosody-based end-of-turn model that finalizes in ~tens of ms. We do NOT use
     # FilterIncompleteUserTurnStrategies here: that LLM-judged gate suppresses the
@@ -1326,48 +1386,67 @@ async def run_bot(
     # phone (choppy Krisp/8kHz transcripts, natural caller pauses), adding multi-second
     # latency to nearly every response. The smart-turn analyzer still avoids cutting
     # callers off mid-sentence, without the per-turn LLM round-trip or silent waits.
-    user_aggregator, assistant_aggregator = LLMContextAggregatorPair(
-        context,
-        user_params=LLMUserAggregatorParams(
-            # OpenAI Realtime uses server-side semantic VAD and requires
-            # 24 kHz input. Silero only accepts 8/16 kHz, so keep local VAD on
-            # the cascade path and let Realtime own turn detection end-to-end.
-            vad_analyzer=None if use_openai_realtime else SileroVADAnalyzer(),
-        ),
-    )
+    if not use_elevenlabs:
+        assert context is not None
+        user_aggregator, assistant_aggregator = LLMContextAggregatorPair(
+            context,
+            user_params=LLMUserAggregatorParams(
+                # OpenAI Realtime uses server-side semantic VAD and requires
+                # 24 kHz input. Silero only accepts 8/16 kHz, so keep local VAD on
+                # the cascade path and let Realtime own turn detection end-to-end.
+                vad_analyzer=None if use_openai_realtime else SileroVADAnalyzer(),
+            ),
+        )
+    else:
+        user_aggregator = assistant_aggregator = None
 
     # P3 — passthrough processor that infers caller tone from final transcripts
     # (no LLM round-trip). Placement differs because Realtime emits transcripts
     # upstream from the LLM while the cascade STT emits them downstream.
     # Adaptive speaking pace: the tone listener feeds the caller's inferred tone
     # to the pace controller, which slows the agent for rushed/upset callers.
-    pace_controller = _make_tts_pace_controller(tts)
-    tone_listener = persona_tools.make_transcript_tone_processor(
-        call_state, context, pace_cb=pace_controller.note_tone
-    )
-    call_end_detector = _make_call_end_detector(call_state, _hangup)
-
-    pipeline_processors = [transport.input()]
-    if use_openai_realtime:
-        # Realtime sends final caller transcription frames upstream from the LLM
-        # service. Observe them before the user aggregator consumes them.
-        pipeline_processors.append(user_aggregator)
-    else:
-        assert stt is not None
-        pipeline_processors.append(stt)
-    pipeline_processors.extend([tone_listener, call_end_detector])
-    if not use_openai_realtime:
-        pipeline_processors.append(user_aggregator)
-    pipeline_processors.append(llm)
-    pipeline_processors.append(tts)
-    # Observe TTSStarted/Stopped just downstream of TTS to retune pace between turns.
-    pipeline_processors.append(pace_controller)
-    pipeline_processors.extend(
-        [
+    if use_elevenlabs:
+        assert convai is not None
+        pipeline_processors = [
+            transport.input(),
+            convai,
             transport.output(),
-            assistant_aggregator,
         ]
-    )
+        tone_listener = None
+    else:
+        assert tts is not None
+        pace_controller = _make_tts_pace_controller(tts)
+        tone_listener = persona_tools.make_transcript_tone_processor(
+            call_state, context, pace_cb=pace_controller.note_tone
+        )
+        call_end_detector = _make_call_end_detector(call_state, _hangup)
+
+        assert stt is not None or use_openai_realtime
+        assert llm is not None
+        assert tts is not None
+        assert user_aggregator is not None
+        assert assistant_aggregator is not None
+        pipeline_processors = [transport.input()]
+        if use_openai_realtime:
+            # Realtime sends final caller transcription frames upstream from the LLM
+            # service. Observe them before the user aggregator consumes them.
+            pipeline_processors.append(user_aggregator)
+        else:
+            assert stt is not None
+            pipeline_processors.append(stt)
+        pipeline_processors.extend([tone_listener, call_end_detector])
+        if not use_openai_realtime:
+            pipeline_processors.append(user_aggregator)
+        pipeline_processors.append(llm)
+        pipeline_processors.append(tts)
+        # Observe TTSStarted/Stopped just downstream of TTS to retune pace between turns.
+        pipeline_processors.append(pace_controller)
+        pipeline_processors.extend(
+            [
+                transport.output(),
+                assistant_aggregator,
+            ]
+        )
     pipeline = Pipeline(pipeline_processors)
 
     worker = PipelineWorker(
@@ -1393,24 +1472,26 @@ async def run_bot(
         _hangup["finalized"] = False
         _hangup["ending"] = False
         logger.info("Client connected")
-        persona_tools.refresh_live_style_directive(call_state, context)
-        opener = (
-            f"A caller just connected. Their number is in the owner's contacts — this is "
-            f"{recognized_caller_name}. Greet them BY NAME right away and warmly (e.g. "
-            f"\"Hey {recognized_caller_name}!\"). Do NOT ask who's calling or ask them to "
-            "confirm their name — you already know them. Then offer to take a message or "
-            "help with a quick question."
-            if recognized_caller_name
-            else "A caller just connected. Greet them and offer to take a message or help "
-                 "with a quick question."
-        )
-        context.add_message(
-            {
-                "role": "user",
-                "content": opener,
-            }
-        )
-        await worker.queue_frames([LLMRunFrame()])
+        if not use_elevenlabs:
+            assert context is not None
+            persona_tools.refresh_live_style_directive(call_state, context)
+            opener = (
+                f"A caller just connected. Their number is in the owner's contacts — this is "
+                f"{recognized_caller_name}. Greet them BY NAME right away and warmly (e.g. "
+                f"\"Hey {recognized_caller_name}!\"). Do NOT ask who's calling or ask them to "
+                "confirm their name — you already know them. Then offer to take a message or "
+                "help with a quick question."
+                if recognized_caller_name
+                else "A caller just connected. Greet them and offer to take a message or help "
+                     "with a quick question."
+            )
+            context.add_message(
+                {
+                    "role": "user",
+                    "content": opener,
+                }
+            )
+            await worker.queue_frames([LLMRunFrame()])
 
     @transport.event_handler("on_client_disconnected")
     async def on_client_disconnected(transport, client):
@@ -1426,7 +1507,12 @@ async def run_bot(
         _vm = call_state["voicemail"]
         _cid_raw = f"{_vm.get('recorded_at', '')}-{_vm.get('caller_number', 'unknown')}"
         _call_id = _cid_raw.replace(":", "").replace("+", "").replace(" ", "-")
-        _turns = cekura_observe._turns_from_context_messages(context.messages)
+        if use_elevenlabs:
+            assert convai is not None
+            _turns = cekura_observe._turns_from_context_messages(convai.messages)
+        else:
+            assert context is not None
+            _turns = cekura_observe._turns_from_context_messages(context.messages)
         await cekura_observe.observe_call(
             call_state,
             call_id=_call_id,
