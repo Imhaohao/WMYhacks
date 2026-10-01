@@ -56,13 +56,13 @@ rsync -az --delete \
 log "sync complete"
 
 # ── 3. uv + deps ───────────────────────────────────────────────────────────────
-UV_PATH=$(ssh_one "$BOX_HOST" bash -lc 'command -v uv || ls "$HOME/.local/bin/uv" 2>/dev/null || ls /opt/homebrew/bin/uv 2>/dev/null || true')
+UV_PATH=$(ssh_one "$BOX_HOST" "bash -lc 'command -v uv || ls \"\$HOME/.local/bin/uv\" 2>/dev/null || ls /opt/homebrew/bin/uv 2>/dev/null || true'")
 if [[ -z "$UV_PATH" ]]; then
     log "uv not found on box — installing"
-    if ! ssh_one "$BOX_HOST" bash -lc 'curl -LsSf https://astral.sh/uv/install.sh | sh'; then
+    if ! ssh_one "$BOX_HOST" "bash -lc 'curl -LsSf https://astral.sh/uv/install.sh | sh'"; then
         die "uv install failed on box"
     fi
-    UV_PATH=$(ssh_one "$BOX_HOST" bash -lc 'command -v uv || ls "$HOME/.local/bin/uv" 2>/dev/null || ls /opt/homebrew/bin/uv 2>/dev/null')
+    UV_PATH=$(ssh_one "$BOX_HOST" "bash -lc 'command -v uv || ls \"\$HOME/.local/bin/uv\" 2>/dev/null || ls /opt/homebrew/bin/uv 2>/dev/null'")
 fi
 [[ -n "$UV_PATH" ]] || die "could not locate uv on box"
 log "uv: $UV_PATH"
@@ -70,7 +70,7 @@ ssh_one "$BOX_HOST" "cd ~/$REMOTE_DIR/server && $UV_PATH sync" || die "uv sync f
 
 # ── 4. Tailscale Funnel (free public URL for Twilio) ───────────────────────────
 log "enabling Tailscale Funnel for port 7860"
-TS_CLI=$(ssh_one "$BOX_HOST" bash -lc 'command -v tailscale || ls /Applications/Tailscale.app/Contents/MacOS/Tailscale 2>/dev/null || true')
+TS_CLI=$(ssh_one "$BOX_HOST" "bash -lc 'command -v tailscale || ls /opt/homebrew/bin/tailscale 2>/dev/null || ls /Applications/Tailscale.app/Contents/MacOS/Tailscale 2>/dev/null || true'")
 [[ -n "$TS_CLI" ]] || die "Tailscale CLI not found on the box"
 if ! ssh_one "$BOX_HOST" "$TS_CLI funnel --bg 7860"; then
     die "Funnel enable failed. Give the node the 'funnel' attribute (Tailscale admin console -> Access Controls -> nodeAttrs, then 'tailscale set --funnel' on the box) and rerun."
@@ -83,9 +83,9 @@ log "funnel serving: $FUNNEL_URL"
 ssh_one "$BOX_HOST" "cd ~/$REMOTE_DIR/server && DEPLOY_URL='$FUNNEL_URL' DEPLOY_UV='$UV_PATH' DEPLOY_PHONE='$PHONE_NUMBER' $UV_PATH run python ops/deploy_on_box.py"
 
 # ── 6. (Re)start the bot under launchd ─────────────────────────────────────────
-ssh_one "$BOX_HOST" bash -lc 'launchctl bootout gui/$UID ~/Library/LaunchAgents/com.voicemail.elevenlabs.plist 2>/dev/null || true'
-ssh_one "$BOX_HOST" bash -lc 'launchctl bootstrap gui/$UID ~/Library/LaunchAgents/com.voicemail.elevenlabs.plist'
-ssh_one "$BOX_HOST" bash -lc 'launchctl kickstart -k gui/$UID/com.voicemail.elevenlabs'
+ssh_one "$BOX_HOST" "bash -lc 'launchctl bootout gui/\$UID ~/Library/LaunchAgents/com.voicemail.elevenlabs.plist 2>/dev/null || true'"
+ssh_one "$BOX_HOST" "bash -lc 'launchctl bootstrap gui/\$UID ~/Library/LaunchAgents/com.voicemail.elevenlabs.plist'"
+ssh_one "$BOX_HOST" "bash -lc 'launchctl kickstart -k gui/\$UID/com.voicemail.elevenlabs'"
 
 # ── 7. Verify ──────────────────────────────────────────────────────────────────
 sleep 25
