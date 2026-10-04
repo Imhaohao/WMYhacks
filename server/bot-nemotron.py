@@ -1180,13 +1180,10 @@ async def run_bot(
 
     all_tools = p1_tools + [bind_call_state(fn) for fn in TOOL_REGISTRY]
 
-    # ── P2: inject persona_context before building system instruction ──────────
-    if tenant_runtime:
-        call_state["persona_context"] = tenant_store.build_persona_context(tenant_runtime)
-    else:
-        from owner_config import build_persona_context
+    # ── P2: inject the one context block before building system instruction ─────
+    from persona_context import build_call_persona_context
 
-        call_state["persona_context"] = build_persona_context()
+    call_state["persona_context"] = build_call_persona_context(tenant_runtime)
 
     # Assistant mode: the live speaker is the owner (testing / calling their own
     # agent), not an inbound stranger — same signal owner_tools uses to authorize
@@ -1205,18 +1202,6 @@ async def run_bot(
     system_instruction = build_system_instruction(
         call_state, caller_name=recognized_caller_name, assistant_mode=assistant_mode
     )
-
-    # P2 (Part A/B): layer the owner's LIVE private context on top of the
-    # owner_config baseline — curated notes plus summaries derived from real
-    # iMessage / Calendar / past Claude sessions (see ingest/, refreshed via
-    # `python -m ingest.refresh`). load_persona_context() returns "" if the file
-    # is missing/empty and appends its own privacy guard, so this is a safe no-op
-    # until persona_context.md is populated.
-    from persona_context import load_persona_context
-
-    persona = "" if tenant_runtime else load_persona_context()
-    if persona:
-        system_instruction += "\n\n" + persona
 
     # ── Services ──────────────────────────────────────────────────────────────
     convai = None

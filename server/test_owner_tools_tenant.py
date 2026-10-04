@@ -6,6 +6,7 @@ import asyncio
 from typing import Any
 
 import owner_tools
+from interfaces import default_call_state
 
 
 class _Params:
@@ -102,3 +103,122 @@ def test_tenant_owner_calendar_uses_tenant_google_not_demo_calendar(monkeypatch)
     assert params.result["connected"] is True
     assert params.result["source"] == "tenant_google_calendar"
     assert params.result["events"][0]["title"] == "Tenant standup"
+
+
+def test_tenant_reminder_is_captured_without_global_reminders(monkeypatch):
+    state = default_call_state(caller_number="+16505550199")
+    state["tenant_runtime"] = {
+        "tenant_id": "tenant-one",
+        "owner_phone": "+16505550100",
+        "owner_email": "owner@example.com",
+    }
+    params = _Params()
+
+    def fail_global_reminders(*_args: Any, **_kwargs: Any) -> dict[str, Any]:
+        raise AssertionError("tenant reminder must not invoke global macOS Reminders")
+
+    monkeypatch.setattr(owner_tools.reminders_client, "add_reminder", fail_global_reminders)
+
+    asyncio.run(
+        owner_tools.add_reminder(
+            params,
+            state,
+            title="Call Alex back",
+            notes="Discuss the contract",
+        )
+    )
+
+    assert params.result == {
+        "ok": True,
+        "status": "captured",
+        "source": "voicemail",
+        "answer_hint": (
+            "Tell the caller you captured the reminder request with the voicemail; "
+            "do not say a native reminder was created."
+        ),
+    }
+    assert state["voicemail"]["action_items"] == ["Call Alex back"]
+    assert state["actions"] == [
+        {
+            "type": "owner_reminder",
+            "status": "captured",
+            "title": "Call Alex back",
+            "notes": "Discuss the contract\nRequested by +16505550199.",
+        }
+    ]
+
+
+def test_legacy_non_owner_reminder_is_captured_and_idempotent(monkeypatch):
+    monkeypatch.delenv("ASSISTANT_MODE", raising=False)
+    monkeypatch.setenv("OWNER_PHONE_NUMBER", "+16505550100")
+    state = default_call_state(caller_number="+16505550199")
+    params = _Params()
+
+    def fail_global_reminders(*_args: Any, **_kwargs: Any) -> dict[str, Any]:
+        raise AssertionError("legacy non-owner reminder must not invoke macOS Reminders")
+
+    monkeypatch.setattr(owner_tools.reminders_client, "add_reminder", fail_global_reminders)
+
+    for _ in range(2):
+        asyncio.run(
+            owner_tools.add_reminder(
+                params,
+                state,
+                title="Call Alex back",
+            )
+        )
+
+    assert params.result is not None
+    assert params.result["status"] == "captured"
+    assert state["voicemail"]["action_items"] == ["Call Alex back"]
+    assert len(state["actions"]) == 1
+    assert state["actions"][0]["notes"] == "Requested by +16505550199."
+
+
+def test_legacy_owner_reminder_keeps_native_reminders_behavior(monkeypatch):
+    monkeypatch.delenv("ASSISTANT_MODE", raising=False)
+    monkeypatch.setenv("OWNER_PHONE_NUMBER", "+16505550100")
+    state = default_call_state(caller_number="+16505550100")
+    params = _Params()
+    calls: list[tuple[str, str | None]] = []
+
+    def fake_add_reminder(title: str, notes: str | None) -> dict[str, Any]:
+        calls.append((title, notes))
+        return {"ok": True, "title": title}
+
+    monkeypatch.setattr(owner_tools.reminders_client, "add_reminder", fake_add_reminder)
+
+    asyncio.run(
+        owner_tools.add_reminder(
+            params,
+            state,
+            title="Review the draft",
+            notes="Before lunch",
+        )
+    )
+
+    assert calls == [("Review the draft", "Before lunch")]
+    assert params.result is not None
+    assert params.result["ok"] is True
+    assert params.result["answer_hint"] == "Confirm you've added the reminder: 'Review the draft'."
+    assert state["voicemail"]["action_items"] == []
+    assert state["actions"] == []
+
+
+def test_empty_reminder_title_does_not_change_call_state(monkeypatch):
+    state = default_call_state(caller_number="+16505550199")
+    params = _Params()
+
+    def fail_global_reminders(*_args: Any, **_kwargs: Any) -> dict[str, Any]:
+        raise AssertionError("empty reminder title must not invoke macOS Reminders")
+
+    monkeypatch.setattr(owner_tools.reminders_client, "add_reminder", fail_global_reminders)
+
+    asyncio.run(owner_tools.add_reminder(params, state, title="  "))
+
+    assert params.result == {
+        "ok": False,
+        "answer_hint": "Ask what the reminder should say.",
+    }
+    assert state["voicemail"]["action_items"] == []
+    assert state["actions"] == []

@@ -85,6 +85,35 @@ def _caller_tag(call_state: CallState) -> str:
     return name or number or "an unidentified caller"
 
 
+def _capture_voicemail_reminder(
+    call_state: CallState,
+    title: str,
+    notes: str | None,
+) -> None:
+    """Record a reminder request without touching a machine-local Reminders app."""
+    action_items = call_state["voicemail"].setdefault("action_items", [])
+    actions = call_state.setdefault("actions", [])
+    normalized_notes = (notes or "").strip()
+    already_captured = any(
+        action.get("type") == "owner_reminder"
+        and action.get("status") == "captured"
+        and action.get("title") == title
+        and (action.get("notes") or "") == normalized_notes
+        for action in actions
+    )
+    if not already_captured:
+        action: dict[str, Any] = {
+            "type": "owner_reminder",
+            "status": "captured",
+            "title": title,
+        }
+        if normalized_notes:
+            action["notes"] = normalized_notes
+        actions.append(action)
+    if title not in action_items:
+        action_items.append(title)
+
+
 # ─── GitHub ──────────────────────────────────────────────────────────────────
 
 
@@ -241,11 +270,26 @@ async def add_reminder(
             {"ok": False, "answer_hint": "Ask what the reminder should say."}
         )
         return
+    owner_session = _owner_session(call_state)
     final_notes = notes
     # Stamp caller-requested reminders so the owner knows the source.
-    if not _owner_session(call_state):
+    if not owner_session:
         tag = f"Requested by {_caller_tag(call_state)}."
         final_notes = f"{notes}\n{tag}" if notes else tag
+    if call_state.get("tenant_runtime") or not owner_session:
+        _capture_voicemail_reminder(call_state, title, final_notes)
+        await params.result_callback(
+            {
+                "ok": True,
+                "status": "captured",
+                "source": "voicemail",
+                "answer_hint": (
+                    "Tell the caller you captured the reminder request with the voicemail; "
+                    "do not say a native reminder was created."
+                ),
+            }
+        )
+        return
     result = await asyncio.to_thread(reminders_client.add_reminder, title, final_notes)
     result["answer_hint"] = (
         f"Confirm you've added the reminder: '{title}'."

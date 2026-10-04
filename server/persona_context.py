@@ -21,8 +21,11 @@ from __future__ import annotations
 import re
 import sys
 from pathlib import Path
+from typing import Any
 
 import persona_cloud
+import tenant_runtime
+import tenant_store
 
 DEFAULT_PATH = Path(__file__).resolve().parent / "persona_context.md"
 
@@ -74,6 +77,32 @@ def load_persona_context(path: str | Path = DEFAULT_PATH,
         return ""
 
     return cleaned + PRIVACY_GUARD if with_guard else cleaned
+
+
+def build_call_persona_context(runtime: dict[str, Any] | None = None) -> str:
+    """Build the context allowed for one legacy or tenant voice call.
+
+    Tenant records are always the base for tenant calls. The worker's global
+    owner context is added only for that same configured owner's tenant; a
+    foreign or incomplete tenant must never read the global persona store.
+    """
+    parts: list[str] = []
+    if runtime:
+        tenant_context = tenant_store.build_persona_context(runtime)
+        if tenant_context:
+            parts.append(tenant_context)
+        if not tenant_runtime.is_configured_owner_runtime(runtime):
+            return "\n\n".join(parts)
+
+    from owner_config import build_persona_context as build_owner_persona_context
+
+    owner_context = build_owner_persona_context()
+    if owner_context:
+        parts.append(owner_context)
+    live_context = load_persona_context()
+    if live_context:
+        parts.append(live_context)
+    return "\n\n".join(parts)
 
 
 def upload_persona_context(path: str | Path = DEFAULT_PATH) -> str | None:

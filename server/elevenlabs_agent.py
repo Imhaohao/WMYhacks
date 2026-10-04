@@ -24,6 +24,7 @@ import json
 import os
 import re
 import sys
+import time
 from collections.abc import Callable, Sequence
 from pathlib import Path
 from typing import Any, cast
@@ -32,6 +33,7 @@ import aiohttp
 from dotenv import load_dotenv
 from loguru import logger
 from pipecat.frames.frames import (
+    CancelFrame,
     EndFrame,
     EndTaskFrame,
     Frame,
@@ -42,6 +44,8 @@ from pipecat.frames.frames import (
     TTSStoppedFrame,
 )
 from pipecat.processors.frame_processor import FrameDirection, FrameProcessor
+
+import tenant_runtime as tenant_runtime_module
 
 _ENV_DIR = Path(__file__).resolve().parent
 load_dotenv(_ENV_DIR / ".env", override=True)
@@ -54,6 +58,7 @@ DEFAULT_TTS_MODEL = "eleven_flash_v2"  # lowest-latency realtime flash model (En
 DEFAULT_LLM = "gemini-2.5-flash"  # fast hosted LLM; override with ELEVENLABS_AGENT_LLM
 DEFAULT_FALLBACK_VOICE_ID = "cjVigY5qzO86Huf0OWal"  # ElevenLabs preset if no clone
 MAX_TOOL_RESULT_CHARS = 12000
+TOOL_DISPATCH_TIMEOUT_SECS = 10.0
 
 # Server events that carry the conversation (see
 # https://elevenlabs.io/docs/eleven-agents/eleven-agents-api/websocket).
@@ -75,20 +80,6 @@ def elevenlabs_api_key() -> str:
     if not key:
         raise RuntimeError("ELEVENLABS_API_KEY is not set — add it to server/.env")
     return key
-
-
-def _normalize_phone(phone: object) -> str:
-    """Normalize the US phone forms used by tenant records and environment config."""
-    digits = "".join(char for char in str(phone or "").strip() if char.isdigit())
-    if len(digits) == 10:
-        return f"+1{digits}"
-    return f"+{digits}" if digits else ""
-
-
-def _is_configured_owner_runtime(tenant_runtime: dict[str, Any]) -> bool:
-    runtime_owner = _normalize_phone(tenant_runtime.get("owner_phone"))
-    configured_owner = _normalize_phone(os.getenv("OWNER_PHONE_NUMBER", ""))
-    return bool(runtime_owner and configured_owner and runtime_owner == configured_owner)
 
 
 def resolve_voice_id(tenant_runtime: dict[str, Any] | None = None) -> str:
@@ -114,7 +105,7 @@ def resolve_voice_id(tenant_runtime: dict[str, Any] | None = None) -> str:
 
     if has_tenant_runtime:
         if (
-            _is_configured_owner_runtime(runtime)
+            tenant_runtime_module.is_configured_owner_runtime(runtime)
             and global_cloned_id
             and tenant_consent
             and global_consent
@@ -223,15 +214,17 @@ async def create_tools(
 ) -> list[str]:
     """Create (or reuse cached) client tools; return their tool_ids."""
     api_key = elevenlabs_api_key()
-    tool_ids: list[str] = []
-    pending: list[tuple[str, dict[str, Any]]] = []
+    configs_by_key: dict[str, dict[str, Any]] = {}
     for fn in functions:
         config = build_client_tool_config(fn)
         cache_key = _schema_cache_key(config)
-        if cache_key in _tool_id_cache:
-            tool_ids.append(_tool_id_cache[cache_key])
-        else:
-            pending.append((cache_key, config))
+        configs_by_key.setdefault(cache_key, config)
+
+    pending = [
+        (cache_key, config)
+        for cache_key, config in configs_by_key.items()
+        if cache_key not in _tool_id_cache
+    ]
 
     async def _create(config: dict[str, Any]) -> tuple[str, dict[str, Any]]:
         async with session.post(
@@ -255,9 +248,7 @@ async def create_tools(
                 raise cast(Exception, result)
             _tool_id_cache[cache_key] = result[0]
 
-    for fn in functions:
-        key = _schema_cache_key(build_client_tool_config(fn))
-        tool_ids.append(_tool_id_cache[key])
+    tool_ids = [_tool_id_cache[cache_key] for cache_key in configs_by_key]
     logger.debug("ElevenLabs: {} client tools ready", len(tool_ids))
     return tool_ids
 
@@ -284,6 +275,11 @@ def build_agent_config(
     llm_id = llm_id or os.getenv("ELEVENLABS_AGENT_LLM", DEFAULT_LLM)
     return {
         "name": "Voicemail Agent",
+        "platform_settings": {
+            "privacy": {
+                "record_voice": False,
+            },
+        },
         "conversation_config": {
             "agent": {
                 "prompt": {
@@ -443,12 +439,15 @@ class ElevenLabsConvAIService(FrameProcessor):
         self._ws: aiohttp.ClientWebSocketResponse | None = None
         self._agent_id: str | None = None
         self._recv_task: asyncio.Task | None = None
+        self._tool_tasks: set[asyncio.Task] = set()
         self._tool_by_name = {fn.__name__: fn for fn in tools}
         self._agent_speaking = False
         self._output_sample_rate = 24000
         self._messages: list[dict[str, str]] = []
         self._opened = False
         self._closing = False
+        self._close_task: asyncio.Task | None = None
+        self._close_owner: asyncio.Task | None = None
         self._connect_task = asyncio.ensure_future(self._connect())
 
     @property
@@ -494,6 +493,7 @@ class ElevenLabsConvAIService(FrameProcessor):
         except Exception as exc:
             logger.error("ElevenLabs ConvAI connect failed: {}", exc)
             self._opened = False
+            await self.close()
 
     async def _receive_messages(self) -> None:
         ws = self._ws
@@ -551,12 +551,10 @@ class ElevenLabsConvAIService(FrameProcessor):
             self._end_agent_turn()
         elif evt_type == EVT_CLIENT_TOOL_CALL:
             call = event.get("client_tool_call", {})
-            asyncio.ensure_future(
-                self._dispatch_tool(
-                    call.get("tool_name", ""),
-                    call.get("tool_call_id", ""),
-                    call.get("parameters", {}),
-                )
+            self._schedule_tool_dispatch(
+                call.get("tool_name", ""),
+                call.get("tool_call_id", ""),
+                call.get("parameters", {}),
             )
         elif evt_type == EVT_PING:
             event_id = (event.get("ping_event", {}) or {}).get("event_id")
@@ -604,21 +602,59 @@ class ElevenLabsConvAIService(FrameProcessor):
         if payload.get("tool_type") == "system" and payload.get("tool_name") == "end_call":
             logger.info("ElevenLabs: agent called end_call — session will close")
 
+    def _schedule_tool_dispatch(
+        self,
+        tool_name: str,
+        tool_call_id: str,
+        params: dict[str, Any],
+    ) -> None:
+        task = asyncio.create_task(self._dispatch_tool(tool_name, tool_call_id, params))
+        self._tool_tasks.add(task)
+        task.add_done_callback(self._tool_tasks.discard)
+
     async def _dispatch_tool(self, tool_name: str, tool_call_id: str, params: dict) -> None:
+        started_at = time.monotonic()
+        status = "error"
         fn = self._tool_by_name.get(tool_name)
         bridge = _ConvAIParams(self, tool_call_id)
-        if fn is None:
-            logger.warning("ElevenLabs: unknown client tool {!r}", tool_name)
-            await self.send_tool_result(
-                tool_call_id, {"ok": False, "error": f"unknown tool {tool_name}"}, is_error=True
-            )
-            return
         try:
-            await fn(bridge, **params)
-        except Exception as exc:
-            logger.exception("ElevenLabs tool %s failed", tool_name)
-            await self.send_tool_result(
-                tool_call_id, {"ok": False, "error": str(exc)[:500]}, is_error=True
+            if fn is None:
+                logger.warning("ElevenLabs: unknown client tool {!r}", tool_name)
+                await self.send_tool_result(
+                    tool_call_id,
+                    {"ok": False, "error": f"unknown tool {tool_name}"},
+                    is_error=True,
+                )
+                status = "unknown"
+            else:
+                try:
+                    await asyncio.wait_for(
+                        fn(bridge, **params),
+                        timeout=TOOL_DISPATCH_TIMEOUT_SECS,
+                    )
+                    status = "ok"
+                except TimeoutError:
+                    status = "timeout"
+                    await self.send_tool_result(
+                        tool_call_id,
+                        {"ok": False, "error": "tool timed out"},
+                        is_error=True,
+                    )
+                except asyncio.CancelledError:
+                    status = "cancelled"
+                    raise
+                except Exception as exc:
+                    status = "error"
+                    logger.warning("ElevenLabs tool {} failed", tool_name)
+                    await self.send_tool_result(
+                        tool_call_id, {"ok": False, "error": str(exc)[:500]}, is_error=True
+                    )
+        finally:
+            logger.info(
+                "ElevenLabs tool {} completed with status={} latency_ms={:.1f}",
+                tool_name,
+                status,
+                (time.monotonic() - started_at) * 1000,
             )
 
     async def send_tool_result(self, tool_call_id: str, result: dict, is_error: bool) -> None:
@@ -642,13 +678,19 @@ class ElevenLabsConvAIService(FrameProcessor):
             logger.warning("ElevenLabs WS send failed: {}", exc)
 
     async def process_frame(self, frame: Frame, direction: FrameDirection) -> None:
-        await super().process_frame(frame, direction)
-        if isinstance(frame, InputAudioRawFrame):
-            await self._on_input_audio(frame)
-        else:
-            await self.push_frame(frame, direction)
-        if isinstance(frame, (EndFrame, EndTaskFrame)):
-            await self.close()
+        try:
+            await super().process_frame(frame, direction)
+            if isinstance(frame, InputAudioRawFrame):
+                await self._on_input_audio(frame)
+            else:
+                await self.push_frame(frame, direction)
+        finally:
+            if isinstance(frame, (CancelFrame, EndFrame, EndTaskFrame)):
+                await self.close()
+
+    async def cleanup(self) -> None:
+        await self.close()
+        await super().cleanup()
 
     async def _on_input_audio(self, frame: InputAudioRawFrame) -> None:
         ws = self._ws
@@ -679,23 +721,44 @@ class ElevenLabsConvAIService(FrameProcessor):
             mono[i * 2 : i * 2 + 2] = ((left + right) // 2).to_bytes(2, "little", signed=True)
         return bytes(mono)
 
-    async def close(self) -> None:
-        if self._closing:
-            return
-        self._closing = True
-        self._connect_task.cancel()
-        if self._recv_task is not None:
-            self._recv_task.cancel()
+    async def _cancel_owned_tasks(self, excluded_task: asyncio.Task | None = None) -> None:
+        current_task = asyncio.current_task()
+        protected_tasks = {current_task, excluded_task}
+        tasks = [self._connect_task, self._recv_task, *self._tool_tasks]
+        self._tool_tasks.clear()
+        pending = [task for task in tasks if task is not None and task not in protected_tasks]
+        for task in pending:
+            if not task.done():
+                task.cancel()
+        if pending:
+            await asyncio.gather(*pending, return_exceptions=True)
+
+    async def _close_resources(self) -> None:
+        await self._cancel_owned_tasks(self._close_owner)
         ws, agent_id, self._ws, self._agent_id = self._ws, self._agent_id, None, None
         if ws is not None and not ws.closed:
             try:
                 await ws.close()
-            except Exception:
-                pass
+            except Exception as exc:
+                logger.debug("ElevenLabs WS close failed: {}", exc)
         if agent_id:
             await delete_agent(self._session, agent_id)
         if not self._session.closed:
-            await self._session.close()
+            try:
+                await self._session.close()
+            except Exception as exc:
+                logger.debug("ElevenLabs HTTP session close failed: {}", exc)
+
+    async def close(self) -> None:
+        current_task = asyncio.current_task()
+        if self._close_task is None:
+            self._closing = True
+            self._opened = False
+            self._close_owner = current_task
+            self._close_task = asyncio.create_task(self._close_resources())
+        if self._close_task is current_task:
+            return
+        await asyncio.shield(self._close_task)
 
 
 # ─── Voice cloning CLI ─────────────────────────────────────────────────────────

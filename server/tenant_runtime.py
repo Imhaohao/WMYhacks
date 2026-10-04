@@ -12,6 +12,26 @@ from loguru import logger
 import tenant_store
 
 
+def _normalize_phone(phone: str | None) -> str:
+    if not phone:
+        return ""
+    digits = "".join(ch for ch in str(phone).strip() if ch.isdigit())
+    if not digits:
+        return ""
+    if len(digits) == 10:
+        return f"+1{digits}"
+    return f"+{digits}"
+
+
+def is_configured_owner_runtime(runtime: dict[str, Any] | None) -> bool:
+    """Return whether a tenant runtime belongs to this worker's configured owner."""
+    if not runtime:
+        return False
+    runtime_owner = _normalize_phone(str(runtime.get("owner_phone") or ""))
+    configured_owner = _normalize_phone(os.getenv("OWNER_PHONE_NUMBER", ""))
+    return bool(runtime_owner and configured_owner and runtime_owner == configured_owner)
+
+
 def _first_str(params: dict[str, Any], *keys: str) -> str:
     for key in keys:
         value = params.get(key)
