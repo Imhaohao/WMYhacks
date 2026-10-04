@@ -77,30 +77,65 @@ def elevenlabs_api_key() -> str:
     return key
 
 
-def resolve_voice_id(tenant_runtime: dict[str, Any] | None = None) -> str:
-    """Owner's ElevenLabs voice clone, tenant clone, or preset fallback.
+def _normalize_phone(phone: object) -> str:
+    """Normalize the US phone forms used by tenant records and environment config."""
+    digits = "".join(char for char in str(phone or "").strip() if char.isdigit())
+    if len(digits) == 10:
+        return f"+1{digits}"
+    return f"+{digits}" if digits else ""
 
-    Mirrors the Gradium resolver: the clone is only used with explicit consent,
-    and a tenant-level clone (from onboarding) wins over the global one.
+
+def _is_configured_owner_runtime(tenant_runtime: dict[str, Any]) -> bool:
+    runtime_owner = _normalize_phone(tenant_runtime.get("owner_phone"))
+    configured_owner = _normalize_phone(os.getenv("OWNER_PHONE_NUMBER", ""))
+    return bool(runtime_owner and configured_owner and runtime_owner == configured_owner)
+
+
+def resolve_voice_id(tenant_runtime: dict[str, Any] | None = None) -> str:
+    """Resolve an ElevenLabs voice without crossing the Gradium/provider boundary.
+
+    Tenant onboarding currently creates Gradium clones, so the generic tenant
+    ``voice_clone_id`` is accepted here only when its provider is explicitly
+    ``elevenlabs``. The configured global clone is reserved for the legacy
+    runtime and the configured owner's tenant call.
     """
-    tenant_runtime = tenant_runtime or {}
-    tenant_cloned_id = str(tenant_runtime.get("voice_clone_id") or "").strip()
-    tenant_consent = bool(tenant_runtime.get("voice_clone_consent"))
-    cloned_id = tenant_cloned_id or os.getenv("ELEVENLABS_VOICE_ID", "").strip()
-    consent = (
-        tenant_consent
-        if tenant_cloned_id
-        else os.getenv("OWNER_VOICE_CONSENT", "false").strip().lower() == "true"
-    )
-    if cloned_id and consent:
+    runtime = tenant_runtime or {}
+    has_tenant_runtime = bool(runtime)
+    tenant_cloned_id = str(runtime.get("voice_clone_id") or "").strip()
+    tenant_provider = str(runtime.get("voice_clone_provider") or "").strip().lower()
+    tenant_consent = bool(runtime.get("voice_clone_consent"))
+    global_cloned_id = os.getenv("ELEVENLABS_VOICE_ID", "").strip()
+    global_consent = os.getenv("OWNER_VOICE_CONSENT", "false").strip().lower() == "true"
+    preset_id = os.getenv("ELEVENLABS_PRESET_VOICE_ID", DEFAULT_FALLBACK_VOICE_ID).strip()
+
+    if tenant_cloned_id and tenant_provider == "elevenlabs" and tenant_consent:
+        logger.info("ElevenLabs TTS: using tenant's consented ElevenLabs cloned voice")
+        return tenant_cloned_id
+
+    if has_tenant_runtime:
+        if (
+            _is_configured_owner_runtime(runtime)
+            and global_cloned_id
+            and tenant_consent
+            and global_consent
+        ):
+            logger.info("ElevenLabs TTS: using configured owner's consented cloned voice")
+            return global_cloned_id
+        if tenant_cloned_id and tenant_provider != "elevenlabs":
+            logger.warning(
+                "Ignoring tenant voice clone for ElevenLabs because its provider is not ElevenLabs."
+            )
+        return preset_id
+
+    if global_cloned_id and global_consent:
         logger.info("ElevenLabs TTS: using owner's consented cloned voice")
-        return cloned_id
-    if cloned_id and not consent:
+        return global_cloned_id
+    if global_cloned_id and not global_consent:
         logger.warning(
             "ELEVENLABS_VOICE_ID is set but OWNER_VOICE_CONSENT != true — falling back "
             "to preset voice. Set OWNER_VOICE_CONSENT=true to use the clone."
         )
-    return os.getenv("ELEVENLABS_PRESET_VOICE_ID", DEFAULT_FALLBACK_VOICE_ID).strip()
+    return preset_id
 
 
 # ─── Tool schema extraction (Pipecat function → ElevenLabs client tool) ───────
@@ -449,7 +484,6 @@ class ElevenLabsConvAIService(FrameProcessor):
                 json.dumps(
                     {
                         "type": "conversation_initiation_client_data",
-                        "source_info": {"source": "voicemail_bot", "version": "1.0"},
                     }
                 )
             )
@@ -479,6 +513,8 @@ class ElevenLabsConvAIService(FrameProcessor):
             raise
         except Exception as exc:
             logger.debug("ElevenLabs WS receive loop ended: {}", exc)
+        if ws.close_code not in (None, 1000, 1001):
+            logger.warning("ElevenLabs WS closed unexpectedly (code={})", ws.close_code)
         # The hosted agent closed the conversation (its end_call system tool,
         # guardrail, or queue timeout). End the local pipeline so the transport
         # disconnects — otherwise the phone line stays open in silence.
@@ -657,7 +693,7 @@ class ElevenLabsConvAIService(FrameProcessor):
             except Exception:
                 pass
         if agent_id:
-            asyncio.ensure_future(delete_agent(self._session, agent_id))
+            await delete_agent(self._session, agent_id)
         if not self._session.closed:
             await self._session.close()
 
