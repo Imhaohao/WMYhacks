@@ -71,6 +71,16 @@ def test_system_instruction_supports_questions_without_leaking_private_context()
     assert "How urgent is this" not in instruction
 
 
+def test_system_instruction_captures_and_saves_messages_before_goodbye() -> None:
+    instruction = build_system_instruction(default_call_state())
+
+    assert "Message capture tools are required state writes, not slow lookups" in instruction
+    assert "call capture_caller_identity or capture_message_reason" in instruction
+    assert "callback result has returned" in instruction
+    assert "Never end a message-taking call before finish_voicemail returns" in instruction
+    assert "do not call end_call immediately" in instruction
+
+
 def test_system_instruction_contact_gates_calendar_and_uses_first_person() -> None:
     state = default_call_state()
     instruction = build_system_instruction(state)
