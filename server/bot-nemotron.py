@@ -791,6 +791,7 @@ async def run_bot(
     # Thinking mode: controls the triage oracle only. Pipeline LLM is always off.
     enable_thinking = (
         not use_openai_realtime
+        and not use_elevenlabs
         and os.getenv("NEMOTRON_ENABLE_THINKING", "false").lower() == "true"
     )
     if enable_thinking:
