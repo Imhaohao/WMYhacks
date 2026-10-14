@@ -85,6 +85,7 @@ from pipecat.services.openai.stt import OpenAISTTService
 from pipecat.transcriptions.language import Language
 
 import caller_snapshot as cs
+import screened_calls
 import tenant_store
 from interfaces import (
     TOOL_REGISTRY,
@@ -1127,8 +1128,7 @@ async def run_bot(
         # fire-and-forget so neither round-trip delays the spoken goodbye:
         #   • SMS  via Twilio (TWILIO_PHONE_NUMBER → OWNER_PHONE_NUMBER)
         #   • Email via Resend (RESEND_API_KEY → OWNER_EMAIL)
-        sms_body = (f"Urgent voicemail: {summary}" if urgency == "urgent" else summary)[:160]
-        _spawn_bg(_send_owner_sms(call_state, sms_body))
+        _spawn_bg(_send_owner_sms(call_state, screened_calls.owner_text(msg, caller_number)))
 
         email_subject = f"[{urgency.upper()}] Voicemail from {name}"
         _spawn_bg(_send_owner_email(call_state, email_subject, summary))

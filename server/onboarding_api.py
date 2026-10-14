@@ -23,6 +23,7 @@ import google_calendar
 import google_gmail
 import message_digest
 import owner_config
+import screened_calls
 import tenant_google
 import tenant_store
 import twilio_provisioning
@@ -422,10 +423,6 @@ def _tenant_activation_missing(record: dict) -> list[str]:
         missing.append("owner_phone")
     if not str(record.get("owner_email") or "").strip():
         missing.append("owner_email")
-    if record.get("voice_clone_status") != "ready":
-        missing.append("voice_clone")
-    if not record.get("diction_profile_lines"):
-        missing.append("diction_profile")
     return missing
 
 
@@ -787,6 +784,22 @@ def activate_tenant_agent(
         raise
     except Exception as exc:
         logger.exception("tenant activation failed")
+        raise _tenant_http_error(exc) from exc
+
+
+@app.get("/api/onboarding/sessions/{tenant_id}/calls")
+def list_tenant_calls(
+    tenant_id: str,
+    x_onboarding_token: str | None = Header(default=None),
+) -> dict:
+    """Newest screened calls for one tenant, as the owner sees them."""
+    _require_public_tenant_onboarding()
+    try:
+        tenant_store.authenticate(tenant_id, _require_tenant_token(x_onboarding_token))
+        return {"ok": True, "calls": screened_calls.list_for_tenant(tenant_id)}
+    except HTTPException:
+        raise
+    except Exception as exc:
         raise _tenant_http_error(exc) from exc
 
 

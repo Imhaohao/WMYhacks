@@ -187,15 +187,64 @@ def test_session_creation_defers_phone_provisioning():
     assert created["phone_assignment"]["assigned"] is False
 
 
-def test_activation_requires_voice_and_diction_before_phone_provisioning():
+def test_activation_needs_only_the_profile_not_voice_or_diction(monkeypatch):
+    monkeypatch.setenv("ENABLE_SHARED_FORWARDING_ROUTING", "true")
+    monkeypatch.setenv("SHARED_FORWARDING_PHONE_NUMBER", "+16506444731")
+    monkeypatch.setattr(
+        onboarding_api.twilio_provisioning,
+        "wire_inbound_webhook",
+        lambda phone: {"ok": True, "voice_url": "https://voice.example.test/", "phone": phone},
+    )
     agent, token = _new_session()
+
+    activated = onboarding_api.activate_tenant_agent(agent["tenant_id"], x_onboarding_token=token)
+
+    assert activated["agent"]["forwarding_phone"] == "+16506444731"
+    assert activated["agent"]["activation_status"] == "ready"
+
+
+def test_activation_still_requires_owner_phone():
+    agent, token = _new_session()
+    tenant_store.update_agent(agent["tenant_id"], token, {"owner_phone": ""})
 
     with pytest.raises(HTTPException) as exc:
         onboarding_api.activate_tenant_agent(agent["tenant_id"], x_onboarding_token=token)
 
     assert exc.value.status_code == 422
-    assert "voice_clone" in exc.value.detail["missing"]
-    assert "diction_profile" in exc.value.detail["missing"]
+    assert exc.value.detail["missing"] == ["owner_phone"]
+
+
+def _voicemail_record(tenant_id: str, name: str) -> dict:
+    return {
+        "record_id": f"rec-{name}",
+        "type": "voicemail",
+        "owner_context_tag": tenant_id,
+        "timestamp": "2026-10-14T21:04:00+00:00",
+        "voicemail": {
+            "caller_number": "+14155550143",
+            "transcript": "Caller: hi it's about the lease",
+            "message": {"caller_name": name, "reason": "the lease renewal"},
+            "sms_sent": True,
+        },
+    }
+
+
+def test_calls_list_only_the_tenants_own_screened_calls(monkeypatch):
+    agent, token = _new_session()
+    other, _ = _new_session()
+    records = [
+        _voicemail_record(agent["tenant_id"], "Maya"),
+        _voicemail_record(other["tenant_id"], "Intruder"),
+    ]
+    monkeypatch.setattr(onboarding_api.screened_calls.persistence, "list_records", lambda _t: records)
+
+    result = onboarding_api.list_tenant_calls(agent["tenant_id"], x_onboarding_token=token)
+
+    assert [call["caller_name"] for call in result["calls"]] == ["Maya"]
+    assert result["calls"][0]["texted"] is True
+    with pytest.raises(HTTPException) as exc:
+        onboarding_api.list_tenant_calls(other["tenant_id"], x_onboarding_token=token)
+    assert exc.value.status_code == 403
 
 
 def test_activation_can_auto_assign_from_phone_pool(monkeypatch):

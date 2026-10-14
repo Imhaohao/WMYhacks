@@ -159,8 +159,13 @@ class _Backend:
         records: list[dict[str, Any]] = []
         try:
             if self.kind == "dynamodb":
-                resp = self._ddb_table.scan()  # type: ignore[union-attr]
-                records = list(resp.get("Items", []))
+                scan_kwargs: dict[str, Any] = {}
+                while True:
+                    resp = self._ddb_table.scan(**scan_kwargs)  # type: ignore[union-attr]
+                    records.extend(resp.get("Items", []))
+                    if "LastEvaluatedKey" not in resp:
+                        break
+                    scan_kwargs["ExclusiveStartKey"] = resp["LastEvaluatedKey"]
             elif self.kind == "s3":
                 paginator = self._s3.get_paginator("list_objects_v2")  # type: ignore[union-attr]
                 for page in paginator.paginate(

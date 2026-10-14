@@ -495,13 +495,7 @@ def build_persona_context(record: dict[str, Any]) -> str:
 
 
 def _refresh_activation_status(record: dict[str, Any]) -> None:
-    if (
-        (record.get("agent_phone") or record.get("forwarding_phone"))
-        and record.get("voice_clone_status") == "ready"
-        and record.get("diction_profile_lines")
-    ):
-        record["activation_status"] = "ready"
-    elif record.get("agent_phone") or record.get("forwarding_phone"):
-        record["activation_status"] = "provisioning"
-    else:
-        record["activation_status"] = "draft"
+    # A voice clone and diction profile only personalise the agent; calls are
+    # answered with a stock voice until they exist, so a phone line is enough.
+    has_line = record.get("agent_phone") or record.get("forwarding_phone")
+    record["activation_status"] = "ready" if has_line else "draft"
