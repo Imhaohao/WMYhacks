@@ -1,3 +1,13 @@
+# Gotchu
+
+When you miss a call, Gotchu answers, asks who is calling and why, and texts you the answer. Sign up with your name and mobile number, dial one carrier code to forward unanswered calls to your Gotchu line, and screened calls show up as texts and in your calls list.
+
+![Screened calls inbox](artifact/gotchu-screened-calls.webp)
+
+Started at the YC Voice Agents Hackathon by Jerry Yan, David Wu and alaramartin. The web app is in [`web/`](web/README.md); the voice worker and onboarding API are in [`server/`](server/PRODUCTION_ONBOARDING.md).
+
+---
+
 # YC Voice Agents Hackathon
 
 Welcome to the YC Voice Agents Hackathon, hosted by [Cekura](https://cekura.com) and [Daily](https://daily.co), in partnership with [NVIDIA](https://nvidia.com), [AWS](https://aws.amazon.com), and [Twilio](https://twilio.com).

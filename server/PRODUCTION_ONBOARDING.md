@@ -20,10 +20,13 @@ The public Vercel site is deployed at
   tenants can forward missed calls to one Twilio number when the carrier
   provides the original owner number.
 
+Activation needs only the owner's name, mobile number and email. A voice clone and diction profile are optional; without them the agent answers in the stock voice.
+
 `onboarding_api.py` exposes guarded tenant routes:
 
 - `POST /api/onboarding/sessions`
 - `GET /api/onboarding/sessions/{tenant_id}`
+- `GET /api/onboarding/sessions/{tenant_id}/calls` (the tenant's screened calls, newest first)
 - `POST /api/onboarding/sessions/{tenant_id}/profile`
 - `POST /api/onboarding/sessions/{tenant_id}/voicemail-forwarding`
 - `POST /api/onboarding/sessions/{tenant_id}/diction`
