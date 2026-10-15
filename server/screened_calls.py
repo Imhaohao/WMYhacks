@@ -14,13 +14,20 @@ def _clean(value: Any) -> str:
     return " ".join(str(value or "").split())
 
 
+def _mid_sentence(phrase: str) -> str:
+    """Lower-case a leading capital ("Moving ...") but keep acronyms ("IRS ...")."""
+    if phrase[1:2].islower():
+        return phrase[:1].lower() + phrase[1:]
+    return phrase
+
+
 def _callback_sentence(message: dict[str, Any], caller_number: str) -> str:
     if not message.get("wants_callback"):
         return ""
     number = _clean(message.get("callback_number"))
     when = _clean(message.get("callback_preferred_time"))
     target = f" at {number}" if number and number != caller_number else ""
-    timing = f", {when}" if when else ""
+    timing = f" {when}" if when else ""
     return f" Wants a call back{target}{timing}."
 
 
@@ -28,7 +35,7 @@ def owner_text(message: dict[str, Any], caller_number: str) -> str:
     """One plain sentence or two telling the owner who called and why."""
     name = _clean(message.get("caller_name")) or "Someone"
     number = _clean(caller_number)
-    reason = _clean(message.get("reason")).rstrip(".")
+    reason = _mid_sentence(_clean(message.get("reason")).rstrip("."))
     who = f"{name} ({number})" if number else name
     about = f" about {reason}" if reason else " but did not say why"
     prefix = "Gotchu, urgent:" if message.get("urgency") == "urgent" else "Gotchu:"
