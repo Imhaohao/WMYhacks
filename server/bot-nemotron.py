@@ -20,9 +20,12 @@ Run locally::
 """
 
 import asyncio
+import functools
+import inspect
 import json
 import os
 import time
+from dataclasses import dataclass
 from pathlib import Path
 from typing import Any, cast
 from urllib.parse import parse_qs
@@ -742,6 +745,841 @@ def _make_call_end_detector(
     return _CallEndDetector()
 
 
+# ─── Per-call state and LLM tools ─────────────────────────────────────────────
+# Each _make_* factory returns one LLM tool bound to this call's state. The
+# returned function's __name__, docstring and annotations are the tool schema the
+# model sees (elevenlabs_agent.build_client_tool_config reads them), so they must
+# stay exactly as written.
+
+_URGENCY_LEVELS = {"urgent": 2, "normal": 1, "low": 0}
+
+_CALLBACK_TOOL_DOC_WEB = (
+    "Store the caller's callback preference for a browser/WebRTC demo call.\n\n"
+    "Args:\n"
+    "    wants_callback: True if the caller wants the owner to call them back.\n"
+    "    callback_number: Always leave empty — do not collect a phone number on web.\n"
+    "    callback_preferred_time: When they prefer a callback (e.g. 'after 3 pm'). "
+    "Omit if not specified."
+)
+_CALLBACK_TOOL_DOC_PHONE = (
+    "Store the caller's callback preference.\n\n"
+    "Args:\n"
+    "    wants_callback: True if the caller wants the owner to call them back.\n"
+    "    callback_number: Phone number to call back. Omit if wants_callback is False.\n"
+    "    callback_preferred_time: When the caller prefers to be called "
+    "(e.g. 'after 3 pm', 'tomorrow morning'). Omit if not specified."
+)
+
+
+async def _finalize_call(call_state: CallState, hangup: dict[str, Any], source: str) -> None:
+    """Persist voicemail + deliver email once per call (idempotent)."""
+    if hangup["finalized"]:
+        return
+    hangup["finalized"] = True
+    logger.info(
+        "Finalizing call ({}) — call_state summary: {}",
+        source,
+        call_state["voicemail"],
+    )
+    import actions
+
+    persona_tools.sync_voicemail_to_snapshot(call_state)
+    try:
+        email_action = await asyncio.to_thread(
+            actions.deliver_owner_email,
+            cast(dict[str, Any], call_state),
+        )
+        if email_action.get("status") == "sent":
+            logger.info("Call finalize: owner email delivered")
+        elif email_action.get("status") == "queued":
+            logger.warning(
+                "Call finalize: email queued to outbox — drain with "
+                "uv run python action_bridge.py --emit"
+            )
+    except Exception as exc:
+        logger.error(f"Call finalize email failed: {exc}")
+    persona_tools.on_call_finished(call_state)
+
+
+def _make_end_call(hangup: dict[str, Any]):
+    async def end_call(params: FunctionCallParams) -> None:
+        """End the call. Only call this AFTER you have said goodbye to the caller
+        in the same turn. The pipeline flushes any queued speech, then hangs up."""
+        logger.info("end_call — pushing EndTaskFrame upstream")
+        hangup["ending"] = True
+        await params.llm.push_frame(EndTaskFrame(), FrameDirection.UPSTREAM)
+        await params.result_callback(
+            {"ok": True}, properties=FunctionCallResultProperties(run_llm=False)
+        )
+
+    return end_call
+
+
+def _make_capture_caller_identity(call_state: CallState):
+    async def capture_caller_identity(params: FunctionCallParams, name: str) -> None:
+        """Store the caller's name. Call this as soon as they give their name.
+
+        Args:
+            name: The caller's name as they stated it.
+        """
+        call_state["voicemail"]["message"]["caller_name"] = name
+        persona_tools.sync_voicemail_to_snapshot(call_state)
+        logger.debug(f"capture_caller_identity: {name!r}")
+        await params.result_callback({"ok": True, "caller_name": name})
+
+    return capture_caller_identity
+
+
+def _make_capture_message_reason(
+    call_state: CallState, triage: dict, enable_thinking: bool
+):
+    async def capture_message_reason(params: FunctionCallParams, reason: str) -> None:
+        """Store the reason the caller is leaving a message. Call this once
+        they've explained what they're calling about, even briefly.
+
+        Args:
+            reason: A concise description of the caller's topic or request.
+        """
+        call_state["voicemail"]["message"]["reason"] = reason
+        persona_tools.sync_voicemail_to_snapshot(call_state)
+        logger.debug("capture_message_reason: %r", reason)
+
+        if enable_thinking:
+            # Launch the triage oracle in the background. By the time the LLM
+            # asks "how urgent is this?" and the caller replies, the reasoning
+            # call will likely be done and capture_urgency can just await it.
+            triage["task"] = asyncio.create_task(
+                _triage_with_thinking(
+                    reason=reason,
+                    caller_name=call_state["voicemail"]["message"].get("caller_name", ""),
+                    stated_urgency="",
+                    persona_context=call_state["persona_context"],
+                )
+            )
+            logger.debug("Triage oracle launched in background")
+
+        await params.result_callback({"ok": True, "reason": reason})
+
+    return capture_message_reason
+
+
+def _normalize_stated_urgency(urgency: str) -> str:
+    stated = urgency.lower().strip()
+    return stated if stated in _URGENCY_LEVELS else "normal"
+
+
+def _log_triage_outcome(stated: str, triage: dict, escalated: bool, final_urgency: str) -> None:
+    model_urgency = triage["urgency"]
+    if escalated:
+        logger.info(
+            "Urgency escalated by triage: caller said %r → model assessed %r "
+            "(conf=%.2f, reason: %s)",
+            stated, model_urgency,
+            triage.get("confidence", 0.0),
+            triage.get("one_line_reason", ""),
+        )
+        return
+    logger.info(
+        "Urgency confirmed: caller=%r model=%r (conf=%.2f) → using %r",
+        stated, model_urgency,
+        triage.get("confidence", 0.0),
+        final_urgency,
+    )
+
+
+async def _resolve_urgency_with_triage(triage_state: dict, stated: str) -> tuple[str, dict]:
+    """Cross-check the caller's stated urgency against the background triage task.
+
+    The model can only escalate what the caller stated, never downgrade it.
+    """
+    if triage_state["task"] is None:
+        return stated, {}
+    try:
+        # asyncio.shield keeps the task alive if wait_for times out,
+        # so the trace still gets logged even when we fall back.
+        triage = await asyncio.wait_for(
+            asyncio.shield(triage_state["task"]), timeout=8.0
+        )
+    except TimeoutError:
+        logger.warning(
+            "Triage oracle timed out — using caller's stated urgency: %r", stated
+        )
+        return stated, {
+            "urgency": stated, "confidence": 0.0,
+            "one_line_reason": "timeout", "reasoning_trace": "",
+        }
+    triage_state["task"] = None
+    model_urgency = triage["urgency"]
+    escalated = _URGENCY_LEVELS.get(model_urgency, 1) > _URGENCY_LEVELS.get(stated, 1)
+    final_urgency = model_urgency if escalated else stated
+    _log_triage_outcome(stated, triage, escalated, final_urgency)
+    return final_urgency, triage
+
+
+def _urgency_tool_result(final_urgency: str, stated: str, triage_meta: dict) -> dict:
+    result: dict[str, Any] = {
+        "ok": True,
+        "urgency": final_urgency,
+        "stated_urgency": stated,
+    }
+    if triage_meta:
+        result["triage"] = {
+            "model_urgency": triage_meta.get("urgency", ""),
+            "confidence": triage_meta.get("confidence", 0.0),
+        }
+    return result
+
+
+def _make_capture_urgency(call_state: CallState, triage: dict):
+    async def capture_urgency(params: FunctionCallParams, urgency: str) -> None:
+        """Store the caller's urgency level, cross-checked against the reasoning
+        triage oracle when NEMOTRON_ENABLE_THINKING is set. The model never
+        downgrades what the caller stated — it can only escalate.
+
+        Args:
+            urgency: One of "urgent", "normal", or "low".
+        """
+        stated = _normalize_stated_urgency(urgency)
+        final_urgency, triage_meta = await _resolve_urgency_with_triage(triage, stated)
+
+        call_state["voicemail"]["message"]["urgency"] = final_urgency
+        call_state["voicemail"]["message"]["triage"] = triage_meta
+        persona_tools.sync_voicemail_to_snapshot(call_state)
+
+        logger.debug("capture_urgency: stated=%r final=%r", stated, final_urgency)
+        await params.result_callback(_urgency_tool_result(final_urgency, stated, triage_meta))
+
+    return capture_urgency
+
+
+def _make_capture_callback_preference(call_state: CallState, web_demo: bool):
+    async def capture_callback_preference(
+        params: FunctionCallParams,
+        wants_callback: bool,
+        callback_number: str = "",
+        callback_preferred_time: str = "",
+    ) -> None:
+        """Store the caller's callback preference."""
+        msg = call_state["voicemail"]["message"]
+        msg["wants_callback"] = wants_callback
+        msg["callback_number"] = "" if web_demo else callback_number
+        msg["callback_preferred_time"] = callback_preferred_time
+        persona_tools.sync_voicemail_to_snapshot(call_state)
+        logger.debug(
+            f"capture_callback_preference: wants={wants_callback} "
+            f"num={callback_number!r} time={callback_preferred_time!r}"
+        )
+        await params.result_callback(
+            {
+                "ok": True,
+                "wants_callback": wants_callback,
+                "callback_number": callback_number,
+                "callback_preferred_time": callback_preferred_time,
+            }
+        )
+
+    capture_callback_preference.__doc__ = (
+        _CALLBACK_TOOL_DOC_WEB if web_demo else _CALLBACK_TOOL_DOC_PHONE
+    )
+    return capture_callback_preference
+
+
+def _make_get_voicemail_summary(call_state: CallState):
+    async def get_voicemail_summary(params: FunctionCallParams) -> None:
+        """Return a short caller-facing confirmation for the collected message.
+
+        Internal urgency labels and the caller snapshot are deliberately omitted.
+        """
+        msg = call_state["voicemail"]["message"]
+        persona_tools.sync_voicemail_to_snapshot(call_state)
+        confirmation = build_caller_confirmation(msg)
+        logger.debug(f"get_voicemail_summary: {confirmation}")
+        await params.result_callback(
+            {
+                "caller_facing_confirmation": confirmation,
+                "instruction": (
+                    "Say only caller_facing_confirmation. Do not add urgency, "
+                    "classification, snapshot, or other internal details."
+                ),
+            }
+        )
+
+    return get_voicemail_summary
+
+
+def _owner_sms_summary(call_state: CallState, note: str) -> str:
+    msg = call_state["voicemail"]["message"]
+    name = msg.get("caller_name") or "Unknown caller"
+    reason = msg.get("reason") or "(reason not yet captured)"
+    urgency = (msg.get("urgency") or "normal").upper()
+    cb_num = msg.get("callback_number") or ""
+    caller_number = call_state["voicemail"]["caller_number"]
+
+    # Build the one-line summary: [URGENCY] Name (number) re: reason — cb: num | note
+    parts = [f"[{urgency}]", name]
+    if caller_number:
+        parts.append(f"({caller_number})")
+    parts.append(f"re: {reason}")
+    if cb_num:
+        parts.append(f"— cb: {cb_num}")
+    if note:
+        parts.append(f"| {note.strip()}")
+    return " ".join(parts)[:160]  # hard cap at Twilio's single-SMS limit
+
+
+def _make_notify_owner_sms(call_state: CallState):
+    async def notify_owner_sms(params: FunctionCallParams, note: str = "") -> None:
+        """Text the owner a one-line callback summary RIGHT NOW via Twilio SMS.
+
+        Call this when the caller explicitly asks to notify the owner immediately
+        (e.g. "can you let them know straight away?") or when you judge the
+        situation warrants it regardless of whether the full message is complete.
+
+        Safety rules (enforced in code — not just the prompt):
+        - SMS goes ONLY to the owner's registered OWNER_PHONE_NUMBER.
+        - The caller's number is never used as a destination.
+        - Duplicate sends within the same call are silently skipped.
+
+        Args:
+            note: Optional extra context to append, max ~30 words.
+                  Examples: "caller is waiting on-site",
+                             "caller sounded very distressed".
+                  Omit for a plain auto-built summary.
+        """
+        # Idempotency: never double-send within the same call.
+        if call_state["voicemail"]["sms_sent"]:
+            logger.info("notify_owner_sms: SMS already sent this call — skipping")
+            await params.result_callback({
+                "ok": True,
+                "skipped": True,
+                "reason": "SMS already sent for this call",
+            })
+            return
+
+        body = _owner_sms_summary(call_state, note)
+        await _send_owner_sms(call_state, body)
+
+        if call_state["voicemail"]["sms_sent"]:
+            logger.info("notify_owner_sms: sent %r", body)
+            await params.result_callback({"ok": True, "body": body})
+        else:
+            await params.result_callback({
+                "ok": False,
+                "reason": "SMS send failed — check TWILIO_* and OWNER_PHONE_NUMBER in .env",
+            })
+
+    return notify_owner_sms
+
+
+def _voicemail_summary_text(call_state: CallState, msg: dict) -> str:
+    name = msg.get("caller_name", "Unknown")
+    reason = msg.get("reason", "")
+    urgency = msg.get("urgency", "normal")
+    wants_cb = msg.get("wants_callback", False)
+    cb_num = msg.get("callback_number", "")
+    cb_time = msg.get("callback_preferred_time", "")
+    caller_number = call_state["voicemail"]["caller_number"]
+
+    cb_clause = ""
+    if wants_cb and cb_num:
+        cb_clause = f" Callback: {cb_num}"
+        if cb_time:
+            cb_clause += f" ({cb_time})"
+        cb_clause += "."
+
+    summary = (
+        f"[{urgency.upper()}] Voicemail from {name}"
+        + (f" ({caller_number})" if caller_number else "")
+        + f": {reason}.{cb_clause}"
+    )
+    return summary + "\n\n" + cs.format_snapshot_summary(
+        cast(dict[str, Any], call_state["caller_snapshot"])
+    )
+
+
+def _voicemail_action_item(msg: dict) -> str:
+    name = msg.get("caller_name", "Unknown")
+    reason = msg.get("reason", "")
+    urgency = msg.get("urgency", "normal")
+    cb_num = msg.get("callback_number", "")
+    cb_time = msg.get("callback_preferred_time", "")
+
+    action = f"[{urgency.upper()}] Reply to {name}"
+    if cb_num:
+        action += f" at {cb_num}"
+    if cb_time:
+        action += f" ({cb_time} preferred)"
+    return action + f" re: {reason}"
+
+
+def _log_finished_voicemail(call_state: CallState, msg: dict, summary: str) -> None:
+    triage_meta = msg.get("triage", {})
+    logger.info(
+        "finish_voicemail | summary=%r | urgency=%s | triage_model=%s "
+        "triage_conf=%.2f | sms_sent=%s",
+        summary,
+        msg.get("urgency", "normal"),
+        triage_meta.get("urgency", "n/a"),
+        triage_meta.get("confidence", 0.0),
+        call_state["voicemail"]["sms_sent"],
+    )
+    # Full message payload (excluding trace to avoid log spam on repeat reads)
+    logger.debug(
+        "finish_voicemail message payload: %s",
+        {k: v for k, v in msg.items() if k not in ("triage",)},
+    )
+
+
+def _notify_owner_of_voicemail(call_state: CallState, msg: dict, summary: str) -> None:
+    # Notify the owner about every completed voicemail — fires now, as the
+    # agent tells the caller it'll pass the message along. Both channels are
+    # fire-and-forget so neither round-trip delays the spoken goodbye:
+    #   • SMS  via Twilio (TWILIO_PHONE_NUMBER → OWNER_PHONE_NUMBER)
+    #   • Email via Resend (RESEND_API_KEY → OWNER_EMAIL)
+    caller_number = call_state["voicemail"]["caller_number"]
+    _spawn_bg(_send_owner_sms(call_state, screened_calls.owner_text(msg, caller_number)))
+
+    name = msg.get("caller_name", "Unknown")
+    urgency = msg.get("urgency", "normal")
+    email_subject = f"[{urgency.upper()}] Voicemail from {name}"
+    _spawn_bg(_send_owner_email(call_state, email_subject, summary))
+
+
+def _make_finish_voicemail(call_state: CallState):
+    async def finish_voicemail(params: FunctionCallParams) -> None:
+        """Persist the voicemail, log the structured summary, and send an SMS
+        to the owner if the message is urgent. Call this at step 6, immediately
+        before saying goodbye and calling end_call."""
+        msg = call_state["voicemail"]["message"]
+        persona_tools.sync_voicemail_to_snapshot(call_state)
+
+        summary = _voicemail_summary_text(call_state, msg)
+        call_state["voicemail"]["summary"] = summary
+        call_state["voicemail"]["action_items"] = [_voicemail_action_item(msg)]
+
+        _log_finished_voicemail(call_state, msg, summary)
+        _notify_owner_of_voicemail(call_state, msg, summary)
+
+        await params.result_callback(
+            {
+                "ok": True,
+                "summary": summary,
+                "instruction": (
+                    "Say a short goodbye now and call end_call in this same turn. "
+                    "Example: 'Great, I'll make sure they get your message. Take care!'"
+                ),
+            }
+        )
+
+    return finish_voicemail
+
+
+def _bind_call_state(fn, call_state: CallState):
+    """Wrap a TOOL_REGISTRY tool so Pipecat sees `(params, ...)` with no call_state arg.
+
+    Convention: if a registry tool's second param is named `call_state`, it
+    gets wrapped; every other tool is returned unchanged.
+    """
+    sig = inspect.signature(fn)
+    param_names = list(sig.parameters.keys())
+    if len(param_names) > 1 and param_names[1] == "call_state":
+        @functools.wraps(fn)
+        async def bound(params, **kwargs):
+            return await fn(params, call_state=call_state, **kwargs)
+        new_params = [p for k, p in sig.parameters.items() if k != "call_state"]
+        setattr(bound, "__signature__", sig.replace(parameters=new_params))
+        return bound
+    return fn
+
+
+def _build_all_tools(
+    call_state: CallState,
+    hangup: dict[str, Any],
+    triage: dict,
+    web_demo: bool,
+    enable_thinking: bool,
+) -> list:
+    """P1 voicemail tools (bound to this call) plus the bound P2/P3 TOOL_REGISTRY tools."""
+    p1_tools = [
+        _make_capture_caller_identity(call_state),
+        _make_capture_message_reason(call_state, triage, enable_thinking),
+        _make_capture_urgency(call_state, triage),
+        _make_capture_callback_preference(call_state, web_demo),
+        _make_notify_owner_sms(call_state),
+        _make_get_voicemail_summary(call_state),
+        _make_finish_voicemail(call_state),
+        _make_end_call(hangup),
+    ]
+    return p1_tools + [_bind_call_state(fn, call_state) for fn in TOOL_REGISTRY]
+
+
+# ─── Voice services ───────────────────────────────────────────────────────────
+
+
+def _elevenlabs_first_message(owner_name: str, recognized_caller_name: str | None) -> str:
+    if recognized_caller_name and owner_name:
+        return (
+            f"Hey {recognized_caller_name}, this is {owner_name}'s assistant. "
+            "What can I do for you?"
+        )
+    if recognized_caller_name:
+        return f"Hey {recognized_caller_name}, I'm the assistant here. What can I do for you?"
+    if owner_name:
+        return (
+            f"Hi, this is {owner_name}'s assistant. {owner_name} can't pick up right now, "
+            "but I can take a message or help with a quick question."
+        )
+    return (
+        "Hi, the owner can't pick up right now, but I can take a message or help "
+        "with a quick question."
+    )
+
+
+def _elevenlabs_asr_keywords(owner_name: str, recognized_caller_name: str | None) -> list[str]:
+    keywords = [
+        term.strip()
+        for term in os.getenv("STT_EXTRA_TERMS", "").split(",")
+        if term.strip()
+    ]
+    if owner_name:
+        keywords.append(owner_name)
+    if recognized_caller_name:
+        keywords.append(recognized_caller_name)
+    return keywords
+
+
+def _build_elevenlabs_service(
+    *,
+    system_instruction: str,
+    recognized_caller_name: str | None,
+    all_tools: list,
+    tenant_runtime: dict[str, Any] | None,
+    call_state: CallState,
+    hangup: dict[str, Any],
+    transport: BaseTransport,
+):
+    from elevenlabs_agent import ElevenLabsConvAIService, resolve_voice_id
+
+    owner_name = os.getenv("OWNER_NAME", "").strip()
+
+    async def _elevenlabs_hangup() -> None:
+        # The hosted agent said goodbye and closed its side. End the media
+        # transport so the phone line / browser call actually hangs up.
+        hangup["ending"] = True
+        await _hang_up_transport(transport)
+
+    convai = ElevenLabsConvAIService(
+        system_prompt=system_instruction,
+        first_message=_elevenlabs_first_message(owner_name, recognized_caller_name),
+        tools=all_tools,
+        voice_id=resolve_voice_id(tenant_runtime),
+        asr_keywords=_elevenlabs_asr_keywords(owner_name, recognized_caller_name),
+        call_state=call_state,
+        hangup_cb=_elevenlabs_hangup,
+    )
+    logger.info("Voice stack: ElevenLabs Conversational AI (flash streaming TTS + managed LLM)")
+    return convai
+
+
+def _build_openai_realtime_llm(system_instruction: str, call_state: CallState):
+    realtime_vad_eagerness = os.getenv("OPENAI_REALTIME_VAD_EAGERNESS", "high")
+    if realtime_vad_eagerness not in ("low", "medium", "high", "auto"):
+        raise ValueError(
+            "OPENAI_REALTIME_VAD_EAGERNESS must be one of: low, medium, high, auto"
+        )
+    return OpenAIRealtimeLLMService(
+        api_key=os.environ["OPENAI_API_KEY"],
+        settings=OpenAIRealtimeLLMService.Settings(
+            model=os.getenv("OPENAI_REALTIME_MODEL", "gpt-realtime-2"),
+            system_instruction=system_instruction,
+            session_properties=SessionProperties(
+                # Keep Realtime's low-latency audio input and semantic VAD,
+                # but synthesize its streamed text with the owner's Gradium
+                # clone instead of an OpenAI built-in voice.
+                output_modalities=["text"],
+                audio=AudioConfiguration(
+                    input=AudioInput(
+                        # Suppress background / far-field voices (e.g. someone
+                        # talking in the room) so the agent isn't derailed by
+                        # speech that isn't the caller right at the mic.
+                        noise_reduction=InputAudioNoiseReduction(type="near_field"),
+                        transcription=InputAudioTranscription(
+                            model=os.getenv(
+                                "OPENAI_REALTIME_TRANSCRIPTION_MODEL",
+                                "gpt-realtime-whisper",
+                            ),
+                            language="en",
+                            # Proper-noun bias (Stanford, names, etc.) so the
+                            # Realtime transcript stops mangling words like
+                            # "Stanford waitlist"/"grape". gpt-4o-transcribe
+                            # honors this best (set it as the model above).
+                            prompt=_build_stt_prompt(call_state) or None,
+                        ),
+                        turn_detection=SemanticTurnDetection(
+                            eagerness=cast(Any, realtime_vad_eagerness)
+                        ),
+                    ),
+                ),
+                reasoning=Reasoning(
+                    effort=os.getenv("OPENAI_REALTIME_REASONING_EFFORT", "minimal")
+                ),
+            ),
+        ),
+    )
+
+
+def _build_nemotron_llm(system_instruction: str):
+    return VLLMOpenAILLMService(
+        api_key=os.getenv("NEMOTRON_LLM_API_KEY", "EMPTY"),
+        base_url=os.getenv("NEMOTRON_LLM_URL", "http://192.168.7.228:8000/v1"),
+        settings=VLLMOpenAILLMService.Settings(
+            model=os.getenv("NEMOTRON_LLM_MODEL", "nvidia/nemotron-3-super"),
+            system_instruction=system_instruction,
+            # Pipeline LLM: thinking always OFF. Reasoning tokens can bleed into
+            # TTS if the vLLM server has no --reasoning-parser configured.
+            # Thinking is used only by the background triage oracle.
+            extra={"extra_body": {"chat_template_kwargs": {"enable_thinking": False}}},
+        ),
+    )
+
+
+def _build_gradium_tts(tenant_runtime: dict[str, Any] | None) -> GradiumTTSService:
+    return GradiumTTSService(
+        api_key=os.environ["GRADIUM_API_KEY"],
+        json_config=_gradium_tts_json_config(),
+        settings=GradiumTTSService.Settings(
+            voice=_resolve_voice_id(tenant_runtime),
+        ),
+    )
+
+
+# ── "One moment" filler before slow tool calls ───────────────────────────────
+# Account/network/osascript lookups take ~0.5–4.5s. Speak a short filler the
+# instant such a tool starts so the caller hears the agent is working instead
+# of dead air. Instant tools (capture_*, snapshot) are excluded — no filler.
+_SLOW_TOOLS = {
+    "check_owner_calendar",
+    "check_owner_inbox",
+    "check_github",
+    "list_reminders",
+    "add_reminder",
+    "get_calendar_context_for_caller",
+    "book_callback_slot",
+    "send_owner_email",
+}
+
+
+def _tool_call_is_slow(function_calls) -> bool:
+    return any(
+        getattr(fc, "function_name", "") in _SLOW_TOOLS for fc in function_calls
+    )
+
+
+def _register_slow_tool_filler(llm: Any) -> None:
+    @llm.event_handler("on_function_calls_started")
+    async def _speak_filler_on_slow_tool(service, function_calls):
+        try:
+            if _tool_call_is_slow(function_calls):
+                await service.push_frame(TTSSpeakFrame("One moment."))
+        except Exception as exc:  # never let a filler break the call
+            logger.warning(f"filler-on-tool failed: {exc}")
+
+
+def _build_user_aggregators(context: LLMContext, use_openai_realtime: bool):
+    # Turn-taking: use Pipecat's default stop strategy (LocalSmartTurnAnalyzerV3),
+    # a prosody-based end-of-turn model that finalizes in ~tens of ms. We do NOT use
+    # FilterIncompleteUserTurnStrategies here: that LLM-judged gate suppresses the
+    # reply and sits silent for incomplete_short_timeout (5s) / incomplete_long_timeout
+    # (10s) whenever it marks a turn ○/◐ "incomplete" — which fires constantly over the
+    # phone (choppy Krisp/8kHz transcripts, natural caller pauses), adding multi-second
+    # latency to nearly every response. The smart-turn analyzer still avoids cutting
+    # callers off mid-sentence, without the per-turn LLM round-trip or silent waits.
+    return LLMContextAggregatorPair(
+        context,
+        user_params=LLMUserAggregatorParams(
+            # OpenAI Realtime uses server-side semantic VAD and requires
+            # 24 kHz input. Silero only accepts 8/16 kHz, so keep local VAD on
+            # the cascade path and let Realtime own turn detection end-to-end.
+            vad_analyzer=None if use_openai_realtime else SileroVADAnalyzer(),
+        ),
+    )
+
+
+def _build_cascade_processors(
+    *,
+    transport: BaseTransport,
+    stt: Any,
+    llm: Any,
+    tts: Any,
+    user_aggregator: Any,
+    assistant_aggregator: Any,
+    call_state: CallState,
+    context: LLMContext,
+    hangup: dict[str, Any],
+    use_openai_realtime: bool,
+) -> list:
+    # P3 — passthrough processor that infers caller tone from final transcripts
+    # (no LLM round-trip). Placement differs because Realtime emits transcripts
+    # upstream from the LLM while the cascade STT emits them downstream.
+    # Adaptive speaking pace: the tone listener feeds the caller's inferred tone
+    # to the pace controller, which slows the agent for rushed/upset callers.
+    assert tts is not None
+    pace_controller = _make_tts_pace_controller(tts)
+    tone_listener = persona_tools.make_transcript_tone_processor(
+        call_state, context, pace_cb=pace_controller.note_tone
+    )
+    call_end_detector = _make_call_end_detector(call_state, hangup)
+
+    assert stt is not None or use_openai_realtime
+    assert llm is not None
+    assert user_aggregator is not None
+    assert assistant_aggregator is not None
+    pipeline_processors = [transport.input()]
+    if use_openai_realtime:
+        # Realtime sends final caller transcription frames upstream from the LLM
+        # service. Observe them before the user aggregator consumes them.
+        pipeline_processors.append(user_aggregator)
+    else:
+        assert stt is not None
+        pipeline_processors.append(stt)
+    pipeline_processors.extend([tone_listener, call_end_detector])
+    if not use_openai_realtime:
+        pipeline_processors.append(user_aggregator)
+    pipeline_processors.append(llm)
+    pipeline_processors.append(tts)
+    # Observe TTSStarted/Stopped just downstream of TTS to retune pace between turns.
+    pipeline_processors.append(pace_controller)
+    pipeline_processors.extend(
+        [
+            transport.output(),
+            assistant_aggregator,
+        ]
+    )
+    return pipeline_processors
+
+
+def _is_assistant_mode(
+    tenant_runtime: dict[str, Any] | None, from_number: str | None
+) -> bool:
+    """True when the live speaker is the owner (testing / calling their own agent).
+
+    Same signal owner_tools uses to authorize private reads. When true, the agent
+    is told it has direct account access so it stops screening the owner like a
+    caller (e.g. "I don't have calendar access").
+    """
+    owner_number = str(
+        (tenant_runtime or {}).get("owner_phone") or os.getenv("OWNER_PHONE_NUMBER", "")
+    ).strip()
+    caller_is_owner = bool(owner_number) and (from_number or "").strip() == owner_number
+    if tenant_runtime:
+        return caller_is_owner
+    explicitly_enabled = os.getenv("ASSISTANT_MODE", "").strip().lower() in ("1", "true", "yes")
+    return explicitly_enabled or caller_is_owner
+
+
+# ─── Call lifecycle event handlers ────────────────────────────────────────────
+
+
+@dataclass
+class _CallSession:
+    call_state: CallState
+    hangup: dict[str, Any]
+    transport: BaseTransport
+    worker: PipelineWorker
+    context: LLMContext | None
+    convai: Any
+    recognized_caller_name: str | None
+    use_openai_realtime: bool
+    use_elevenlabs: bool
+
+
+def _caller_connected_opener(recognized_caller_name: str | None) -> str:
+    if not recognized_caller_name:
+        return (
+            "A caller just connected. Greet them and offer to take a message or help "
+            "with a quick question."
+        )
+    return (
+        "A caller just connected. Their number is in the owner's contacts — this is "
+        f"{recognized_caller_name}. Greet them BY NAME right away and warmly (e.g. "
+        f"\"Hey {recognized_caller_name}!\"). Do NOT ask who's calling or ask them to "
+        "confirm their name — you already know them. Then offer to take a message or "
+        "help with a quick question."
+    )
+
+
+async def _handle_pipeline_finished(session: _CallSession, frame: Any) -> None:
+    if isinstance(frame, EndFrame) and session.hangup["ending"]:
+        logger.info("Pipeline ended after end_call — hanging up transport")
+        await _finalize_call(session.call_state, session.hangup, "end_call")
+        await _hang_up_transport(session.transport)
+
+
+async def _handle_client_connected(session: _CallSession) -> None:
+    session.hangup["finalized"] = False
+    session.hangup["ending"] = False
+    logger.info("Client connected")
+    if session.use_elevenlabs:
+        return
+    context = session.context
+    assert context is not None
+    persona_tools.refresh_live_style_directive(session.call_state, context)
+    context.add_message(
+        {
+            "role": "user",
+            "content": _caller_connected_opener(session.recognized_caller_name),
+        }
+    )
+    await session.worker.queue_frames([LLMRunFrame()])
+
+
+async def _report_call_to_cekura(session: _CallSession) -> None:
+    """Cekura Observability (fire-and-forget, never raises)."""
+    call_state = session.call_state
+    voicemail = call_state["voicemail"]
+    raw_call_id = f"{voicemail.get('recorded_at', '')}-{voicemail.get('caller_number', 'unknown')}"
+    call_id = raw_call_id.replace(":", "").replace("+", "").replace(" ", "-")
+    if session.use_elevenlabs:
+        assert session.convai is not None
+        turns = cekura_observe._turns_from_context_messages(session.convai.messages)
+    else:
+        assert session.context is not None
+        turns = cekura_observe._turns_from_context_messages(session.context.messages)
+    await cekura_observe.observe_call(
+        call_state,
+        call_id=call_id,
+        customer_number=voicemail.get("caller_number") or None,
+        transcript_turns=turns,
+    )
+
+
+async def _handle_client_disconnected(session: _CallSession) -> None:
+    call_state = session.call_state
+    logger.info(f"Client disconnected — call_state summary: {call_state['voicemail']}")
+    if session.use_openai_realtime:
+        # Realtime can still be dispatching final tool calls after Twilio
+        # closes its media websocket. Give those structured captures a brief
+        # chance to land before persistence snapshots call_state.
+        await asyncio.sleep(1.0)
+    await _finalize_call(call_state, session.hangup, "disconnect")
+    await _report_call_to_cekura(session)
+    await session.worker.cancel()
+
+
+def _register_call_event_handlers(session: _CallSession) -> None:
+    @session.worker.event_handler("on_pipeline_finished")
+    async def on_pipeline_finished(worker, frame):
+        await _handle_pipeline_finished(session, frame)
+
+    @session.transport.event_handler("on_client_connected")
+    async def on_client_connected(transport, client):
+        await _handle_client_connected(session)
+
+    @session.transport.event_handler("on_client_disconnected")
+    async def on_client_disconnected(transport, client):
+        await _handle_client_disconnected(session)
+
+
 # ─── Main bot ─────────────────────────────────────────────────────────────────
 
 
@@ -782,7 +1620,7 @@ async def run_bot(
             "expected 'nemotron', 'openai-realtime' or 'elevenlabs'"
         )
 
-    # One CallState per call — closed over by all P1 tool closures below.
+    # One CallState per call — closed over by all P1 tool closures.
     call_state = default_call_state(caller_number=from_number or "")
     tenant_runtime = _tenant_runtime_for_call(to_number, forwarded_from=forwarded_from)
     call_state["tenant_runtime"] = tenant_runtime
@@ -799,639 +1637,78 @@ async def run_bot(
         logger.info("Thinking mode enabled — triage oracle will use Nemotron reasoning")
 
     # Mutable container for the background triage task; avoids nonlocal boilerplate.
-    _triage: dict = {"task": None}
-    _hangup: dict[str, Any] = {"worker": None, "finalized": False, "ending": False}
+    triage: dict = {"task": None}
+    hangup: dict[str, Any] = {"worker": None, "finalized": False, "ending": False}
 
-    async def _finalize_call(source: str) -> None:
-        """Persist voicemail + deliver email once per call (idempotent)."""
-        if _hangup["finalized"]:
-            return
-        _hangup["finalized"] = True
-        logger.info(
-            "Finalizing call ({}) — call_state summary: {}",
-            source,
-            call_state["voicemail"],
-        )
-        import actions
-
-        persona_tools.sync_voicemail_to_snapshot(call_state)
-        try:
-            email_action = await asyncio.to_thread(
-                actions.deliver_owner_email,
-                cast(dict[str, Any], call_state),
-            )
-            if email_action.get("status") == "sent":
-                logger.info("Call finalize: owner email delivered")
-            elif email_action.get("status") == "queued":
-                logger.warning(
-                    "Call finalize: email queued to outbox — drain with "
-                    "uv run python action_bridge.py --emit"
-                )
-        except Exception as exc:
-            logger.error(f"Call finalize email failed: {exc}")
-        persona_tools.on_call_finished(call_state)
-
-    async def end_call(params: FunctionCallParams) -> None:
-        """End the call. Only call this AFTER you have said goodbye to the caller
-        in the same turn. The pipeline flushes any queued speech, then hangs up."""
-        logger.info("end_call — pushing EndTaskFrame upstream")
-        _hangup["ending"] = True
-        await params.llm.push_frame(EndTaskFrame(), FrameDirection.UPSTREAM)
-        await params.result_callback(
-            {"ok": True}, properties=FunctionCallResultProperties(run_llm=False)
-        )
-
-    # ── P1 voicemail tools (closures — close over call_state directly) ────────
-
-    async def capture_caller_identity(params: FunctionCallParams, name: str) -> None:
-        """Store the caller's name. Call this as soon as they give their name.
-
-        Args:
-            name: The caller's name as they stated it.
-        """
-        call_state["voicemail"]["message"]["caller_name"] = name
-        persona_tools.sync_voicemail_to_snapshot(call_state)
-        logger.debug(f"capture_caller_identity: {name!r}")
-        await params.result_callback({"ok": True, "caller_name": name})
-
-    async def capture_message_reason(params: FunctionCallParams, reason: str) -> None:
-        """Store the reason the caller is leaving a message. Call this once
-        they've explained what they're calling about, even briefly.
-
-        Args:
-            reason: A concise description of the caller's topic or request.
-        """
-        call_state["voicemail"]["message"]["reason"] = reason
-        persona_tools.sync_voicemail_to_snapshot(call_state)
-        logger.debug("capture_message_reason: %r", reason)
-
-        if enable_thinking:
-            # Launch the triage oracle in the background. By the time the LLM
-            # asks "how urgent is this?" and the caller replies, the reasoning
-            # call will likely be done and capture_urgency can just await it.
-            _triage["task"] = asyncio.create_task(
-                _triage_with_thinking(
-                    reason=reason,
-                    caller_name=call_state["voicemail"]["message"].get("caller_name", ""),
-                    stated_urgency="",
-                    persona_context=call_state["persona_context"],
-                )
-            )
-            logger.debug("Triage oracle launched in background")
-
-        await params.result_callback({"ok": True, "reason": reason})
-
-    async def capture_urgency(params: FunctionCallParams, urgency: str) -> None:
-        """Store the caller's urgency level, cross-checked against the reasoning
-        triage oracle when NEMOTRON_ENABLE_THINKING is set. The model never
-        downgrades what the caller stated — it can only escalate.
-
-        Args:
-            urgency: One of "urgent", "normal", or "low".
-        """
-        _LEVELS = {"urgent": 2, "normal": 1, "low": 0}
-
-        stated = urgency.lower().strip()
-        if stated not in _LEVELS:
-            stated = "normal"
-
-        final_urgency = stated
-        triage_meta: dict = {}
-
-        if _triage["task"] is not None:
-            try:
-                # asyncio.shield keeps the task alive if wait_for times out,
-                # so the trace still gets logged even when we fall back.
-                triage = await asyncio.wait_for(
-                    asyncio.shield(_triage["task"]), timeout=8.0
-                )
-                _triage["task"] = None
-                triage_meta = triage
-                model_urgency = triage["urgency"]
-
-                if _LEVELS.get(model_urgency, 1) > _LEVELS.get(stated, 1):
-                    final_urgency = model_urgency
-                    logger.info(
-                        "Urgency escalated by triage: caller said %r → model assessed %r "
-                        "(conf=%.2f, reason: %s)",
-                        stated, model_urgency,
-                        triage.get("confidence", 0.0),
-                        triage.get("one_line_reason", ""),
-                    )
-                else:
-                    logger.info(
-                        "Urgency confirmed: caller=%r model=%r (conf=%.2f) → using %r",
-                        stated, model_urgency,
-                        triage.get("confidence", 0.0),
-                        final_urgency,
-                    )
-            except TimeoutError:
-                logger.warning(
-                    "Triage oracle timed out — using caller's stated urgency: %r", stated
-                )
-                triage_meta = {
-                    "urgency": stated, "confidence": 0.0,
-                    "one_line_reason": "timeout", "reasoning_trace": "",
-                }
-
-        call_state["voicemail"]["message"]["urgency"] = final_urgency
-        call_state["voicemail"]["message"]["triage"] = triage_meta
-        persona_tools.sync_voicemail_to_snapshot(call_state)
-
-        logger.debug("capture_urgency: stated=%r final=%r", stated, final_urgency)
-        await params.result_callback({
-            "ok": True,
-            "urgency": final_urgency,
-            "stated_urgency": stated,
-            **({"triage": {
-                "model_urgency": triage_meta.get("urgency", ""),
-                "confidence": triage_meta.get("confidence", 0.0),
-            }} if triage_meta else {}),
-        })
-
-    _CALLBACK_TOOL_DOC_WEB = (
-        "Store the caller's callback preference for a browser/WebRTC demo call.\n\n"
-        "Args:\n"
-        "    wants_callback: True if the caller wants the owner to call them back.\n"
-        "    callback_number: Always leave empty — do not collect a phone number on web.\n"
-        "    callback_preferred_time: When they prefer a callback (e.g. 'after 3 pm'). "
-        "Omit if not specified."
-    )
-    _CALLBACK_TOOL_DOC_PHONE = (
-        "Store the caller's callback preference.\n\n"
-        "Args:\n"
-        "    wants_callback: True if the caller wants the owner to call them back.\n"
-        "    callback_number: Phone number to call back. Omit if wants_callback is False.\n"
-        "    callback_preferred_time: When the caller prefers to be called "
-        "(e.g. 'after 3 pm', 'tomorrow morning'). Omit if not specified."
-    )
-
-    async def capture_callback_preference(
-        params: FunctionCallParams,
-        wants_callback: bool,
-        callback_number: str = "",
-        callback_preferred_time: str = "",
-    ) -> None:
-        """Store the caller's callback preference."""
-        msg = call_state["voicemail"]["message"]
-        msg["wants_callback"] = wants_callback
-        msg["callback_number"] = "" if web_demo else callback_number
-        msg["callback_preferred_time"] = callback_preferred_time
-        persona_tools.sync_voicemail_to_snapshot(call_state)
-        logger.debug(
-            f"capture_callback_preference: wants={wants_callback} "
-            f"num={callback_number!r} time={callback_preferred_time!r}"
-        )
-        await params.result_callback(
-            {
-                "ok": True,
-                "wants_callback": wants_callback,
-                "callback_number": callback_number,
-                "callback_preferred_time": callback_preferred_time,
-            }
-        )
-
-    async def get_voicemail_summary(params: FunctionCallParams) -> None:
-        """Return a short caller-facing confirmation for the collected message.
-
-        Internal urgency labels and the caller snapshot are deliberately omitted.
-        """
-        msg = call_state["voicemail"]["message"]
-        persona_tools.sync_voicemail_to_snapshot(call_state)
-        confirmation = build_caller_confirmation(msg)
-        logger.debug(f"get_voicemail_summary: {confirmation}")
-        await params.result_callback(
-            {
-                "caller_facing_confirmation": confirmation,
-                "instruction": (
-                    "Say only caller_facing_confirmation. Do not add urgency, "
-                    "classification, snapshot, or other internal details."
-                ),
-            }
-        )
-
-    async def notify_owner_sms(params: FunctionCallParams, note: str = "") -> None:
-        """Text the owner a one-line callback summary RIGHT NOW via Twilio SMS.
-
-        Call this when the caller explicitly asks to notify the owner immediately
-        (e.g. "can you let them know straight away?") or when you judge the
-        situation warrants it regardless of whether the full message is complete.
-
-        Safety rules (enforced in code — not just the prompt):
-        - SMS goes ONLY to the owner's registered OWNER_PHONE_NUMBER.
-        - The caller's number is never used as a destination.
-        - Duplicate sends within the same call are silently skipped.
-
-        Args:
-            note: Optional extra context to append, max ~30 words.
-                  Examples: "caller is waiting on-site",
-                             "caller sounded very distressed".
-                  Omit for a plain auto-built summary.
-        """
-        # Idempotency: never double-send within the same call.
-        if call_state["voicemail"]["sms_sent"]:
-            logger.info("notify_owner_sms: SMS already sent this call — skipping")
-            await params.result_callback({
-                "ok": True,
-                "skipped": True,
-                "reason": "SMS already sent for this call",
-            })
-            return
-
-        msg = call_state["voicemail"]["message"]
-        name = msg.get("caller_name") or "Unknown caller"
-        reason = msg.get("reason") or "(reason not yet captured)"
-        urgency = (msg.get("urgency") or "normal").upper()
-        cb_num = msg.get("callback_number") or ""
-        caller_number = call_state["voicemail"]["caller_number"]
-
-        # Build the one-line summary: [URGENCY] Name (number) re: reason — cb: num | note
-        parts = [f"[{urgency}]", name]
-        if caller_number:
-            parts.append(f"({caller_number})")
-        parts.append(f"re: {reason}")
-        if cb_num:
-            parts.append(f"— cb: {cb_num}")
-        if note:
-            parts.append(f"| {note.strip()}")
-        body = " ".join(parts)[:160]  # hard cap at Twilio's single-SMS limit
-
-        await _send_owner_sms(call_state, body)
-
-        if call_state["voicemail"]["sms_sent"]:
-            logger.info("notify_owner_sms: sent %r", body)
-            await params.result_callback({"ok": True, "body": body})
-        else:
-            await params.result_callback({
-                "ok": False,
-                "reason": "SMS send failed — check TWILIO_* and OWNER_PHONE_NUMBER in .env",
-            })
-
-    async def finish_voicemail(params: FunctionCallParams) -> None:
-        """Persist the voicemail, log the structured summary, and send an SMS
-        to the owner if the message is urgent. Call this at step 6, immediately
-        before saying goodbye and calling end_call."""
-        msg = call_state["voicemail"]["message"]
-        name = msg.get("caller_name", "Unknown")
-        reason = msg.get("reason", "")
-        urgency = msg.get("urgency", "normal")
-        wants_cb = msg.get("wants_callback", False)
-        cb_num = msg.get("callback_number", "")
-        cb_time = msg.get("callback_preferred_time", "")
-        caller_number = call_state["voicemail"]["caller_number"]
-        persona_tools.sync_voicemail_to_snapshot(call_state)
-
-        # Build human-readable summary
-        cb_clause = ""
-        if wants_cb and cb_num:
-            cb_clause = f" Callback: {cb_num}"
-            if cb_time:
-                cb_clause += f" ({cb_time})"
-            cb_clause += "."
-
-        summary = (
-            f"[{urgency.upper()}] Voicemail from {name}"
-            + (f" ({caller_number})" if caller_number else "")
-            + f": {reason}.{cb_clause}"
-        )
-        summary += "\n\n" + cs.format_snapshot_summary(
-            cast(dict[str, Any], call_state["caller_snapshot"])
-        )
-        call_state["voicemail"]["summary"] = summary
-
-        action = f"[{urgency.upper()}] Reply to {name}"
-        if cb_num:
-            action += f" at {cb_num}"
-        if cb_time:
-            action += f" ({cb_time} preferred)"
-        action += f" re: {reason}"
-        call_state["voicemail"]["action_items"] = [action]
-
-        triage_meta = msg.get("triage", {})
-        logger.info(
-            "finish_voicemail | summary=%r | urgency=%s | triage_model=%s "
-            "triage_conf=%.2f | sms_sent=%s",
-            summary,
-            urgency,
-            triage_meta.get("urgency", "n/a"),
-            triage_meta.get("confidence", 0.0),
-            call_state["voicemail"]["sms_sent"],
-        )
-        # Full message payload (excluding trace to avoid log spam on repeat reads)
-        logger.debug(
-            "finish_voicemail message payload: %s",
-            {k: v for k, v in msg.items() if k not in ("triage",)},
-        )
-
-        # Notify the owner about every completed voicemail — fires now, as the
-        # agent tells the caller it'll pass the message along. Both channels are
-        # fire-and-forget so neither round-trip delays the spoken goodbye:
-        #   • SMS  via Twilio (TWILIO_PHONE_NUMBER → OWNER_PHONE_NUMBER)
-        #   • Email via Resend (RESEND_API_KEY → OWNER_EMAIL)
-        _spawn_bg(_send_owner_sms(call_state, screened_calls.owner_text(msg, caller_number)))
-
-        email_subject = f"[{urgency.upper()}] Voicemail from {name}"
-        _spawn_bg(_send_owner_email(call_state, email_subject, summary))
-
-        await params.result_callback(
-            {
-                "ok": True,
-                "summary": summary,
-                "instruction": (
-                    "Say a short goodbye now and call end_call in this same turn. "
-                    "Example: 'Great, I'll make sure they get your message. Take care!'"
-                ),
-            }
-        )
-
-    capture_callback_preference.__doc__ = (
-        _CALLBACK_TOOL_DOC_WEB if web_demo else _CALLBACK_TOOL_DOC_PHONE
-    )
-
-    # P1's tool list — closures above + end_call
-    p1_tools = [
-        capture_caller_identity,
-        capture_message_reason,
-        capture_urgency,
-        capture_callback_preference,
-        notify_owner_sms,
-        get_voicemail_summary,
-        finish_voicemail,
-        end_call,
-    ]
-
-    # ── Bind call_state into P2/P3 TOOL_REGISTRY entries ─────────────────────
-    # Convention: if a registry tool's second param is named `call_state`, it
-    # gets wrapped so Pipecat sees `(params, ...)` with no call_state arg.
-
-    import functools
-    import inspect
-
-    def bind_call_state(fn):
-        sig = inspect.signature(fn)
-        param_names = list(sig.parameters.keys())
-        if len(param_names) > 1 and param_names[1] == "call_state":
-            @functools.wraps(fn)
-            async def bound(params, **kwargs):
-                return await fn(params, call_state=call_state, **kwargs)
-            new_params = [p for k, p in sig.parameters.items() if k != "call_state"]
-            setattr(bound, "__signature__", sig.replace(parameters=new_params))
-            return bound
-        return fn
-
-    all_tools = p1_tools + [bind_call_state(fn) for fn in TOOL_REGISTRY]
+    all_tools = _build_all_tools(call_state, hangup, triage, web_demo, enable_thinking)
 
     # ── P2: inject the one context block before building system instruction ─────
     from persona_context import build_call_persona_context
 
     call_state["persona_context"] = build_call_persona_context(tenant_runtime)
 
-    # Assistant mode: the live speaker is the owner (testing / calling their own
-    # agent), not an inbound stranger — same signal owner_tools uses to authorize
-    # private reads. When true, the agent is told it has direct account access so
-    # it stops screening the owner like a caller (e.g. "I don't have calendar access").
-    _owner_number = str(
-        tenant_runtime.get("owner_phone") or os.getenv("OWNER_PHONE_NUMBER", "")
-    ).strip()
-    if tenant_runtime:
-        assistant_mode = bool(_owner_number) and (from_number or "").strip() == _owner_number
-    else:
-        assistant_mode = (
-            os.getenv("ASSISTANT_MODE", "").strip().lower() in ("1", "true", "yes")
-            or (bool(_owner_number) and (from_number or "").strip() == _owner_number)
-        )
+    assistant_mode = _is_assistant_mode(tenant_runtime, from_number)
     system_instruction = build_system_instruction(
         call_state, caller_name=recognized_caller_name, assistant_mode=assistant_mode
     )
 
     # ── Services ──────────────────────────────────────────────────────────────
     convai = None
+    stt = None
+    llm = None
+    tts = None
     if use_elevenlabs:
-        from elevenlabs_agent import ElevenLabsConvAIService, resolve_voice_id
-
-        _owner_name = os.getenv("OWNER_NAME", "").strip()
-        if recognized_caller_name:
-            _first_message = (
-                f"Hey {recognized_caller_name}, this is {_owner_name}'s assistant. "
-                "What can I do for you?"
-            ) if _owner_name else (
-                f"Hey {recognized_caller_name}, I'm the assistant here. What can I do for you?"
-            )
-        else:
-            _first_message = (
-                f"Hi, this is {_owner_name}'s assistant. {_owner_name} can't pick up right now, "
-                "but I can take a message or help with a quick question."
-            ) if _owner_name else (
-                "Hi, the owner can't pick up right now, but I can take a message or help "
-                "with a quick question."
-            )
-        _asr_keywords = [
-            term.strip()
-            for term in os.getenv("STT_EXTRA_TERMS", "").split(",")
-            if term.strip()
-        ]
-        if _owner_name:
-            _asr_keywords.append(_owner_name)
-        if recognized_caller_name:
-            _asr_keywords.append(recognized_caller_name)
-        async def _elevenlabs_hangup() -> None:
-            # The hosted agent said goodbye and closed its side. End the media
-            # transport so the phone line / browser call actually hangs up.
-            _hangup["ending"] = True
-            await _hang_up_transport(transport)
-
-        convai = ElevenLabsConvAIService(
-            system_prompt=system_instruction,
-            first_message=_first_message,
-            tools=all_tools,
-            voice_id=resolve_voice_id(tenant_runtime),
-            asr_keywords=_asr_keywords,
+        convai = _build_elevenlabs_service(
+            system_instruction=system_instruction,
+            recognized_caller_name=recognized_caller_name,
+            all_tools=all_tools,
+            tenant_runtime=tenant_runtime,
             call_state=call_state,
-            hangup_cb=_elevenlabs_hangup,
-        )
-        logger.info("Voice stack: ElevenLabs Conversational AI (flash streaming TTS + managed LLM)")
-        stt = None
-        llm = None
-    elif use_openai_realtime:
-        stt = None
-        realtime_vad_eagerness = os.getenv("OPENAI_REALTIME_VAD_EAGERNESS", "high")
-        if realtime_vad_eagerness not in ("low", "medium", "high", "auto"):
-            raise ValueError(
-                "OPENAI_REALTIME_VAD_EAGERNESS must be one of: low, medium, high, auto"
-            )
-        llm = OpenAIRealtimeLLMService(
-            api_key=os.environ["OPENAI_API_KEY"],
-            settings=OpenAIRealtimeLLMService.Settings(
-                model=os.getenv("OPENAI_REALTIME_MODEL", "gpt-realtime-2"),
-                system_instruction=system_instruction,
-                session_properties=SessionProperties(
-                    # Keep Realtime's low-latency audio input and semantic VAD,
-                    # but synthesize its streamed text with the owner's Gradium
-                    # clone instead of an OpenAI built-in voice.
-                    output_modalities=["text"],
-                    audio=AudioConfiguration(
-                        input=AudioInput(
-                            # Suppress background / far-field voices (e.g. someone
-                            # talking in the room) so the agent isn't derailed by
-                            # speech that isn't the caller right at the mic.
-                            noise_reduction=InputAudioNoiseReduction(type="near_field"),
-                            transcription=InputAudioTranscription(
-                                model=os.getenv(
-                                    "OPENAI_REALTIME_TRANSCRIPTION_MODEL",
-                                    "gpt-realtime-whisper",
-                                ),
-                                language="en",
-                                # Proper-noun bias (Stanford, names, etc.) so the
-                                # Realtime transcript stops mangling words like
-                                # "Stanford waitlist"/"grape". gpt-4o-transcribe
-                                # honors this best (set it as the model above).
-                                prompt=_build_stt_prompt(call_state) or None,
-                            ),
-                            turn_detection=SemanticTurnDetection(
-                                eagerness=cast(Any, realtime_vad_eagerness)
-                            ),
-                        ),
-                    ),
-                    reasoning=Reasoning(
-                        effort=os.getenv("OPENAI_REALTIME_REASONING_EFFORT", "minimal")
-                    ),
-                ),
-            ),
+            hangup=hangup,
+            transport=transport,
         )
     else:
-        stt = _build_cascade_stt(call_state)
+        if use_openai_realtime:
+            llm = _build_openai_realtime_llm(system_instruction, call_state)
+        else:
+            stt = _build_cascade_stt(call_state)
+            llm = _build_nemotron_llm(system_instruction)
+        tts = _build_gradium_tts(tenant_runtime)
 
-        llm = VLLMOpenAILLMService(
-            api_key=os.getenv("NEMOTRON_LLM_API_KEY", "EMPTY"),
-            base_url=os.getenv("NEMOTRON_LLM_URL", "http://192.168.7.228:8000/v1"),
-            settings=VLLMOpenAILLMService.Settings(
-                model=os.getenv("NEMOTRON_LLM_MODEL", "nvidia/nemotron-3-super"),
-                system_instruction=system_instruction,
-                # Pipeline LLM: thinking always OFF. Reasoning tokens can bleed into
-                # TTS if the vLLM server has no --reasoning-parser configured.
-                # Thinking is used only by the background triage oracle.
-                extra={"extra_body": {"chat_template_kwargs": {"enable_thinking": False}}},
-            ),
-        )
-
-    if use_elevenlabs:
-        tts = None
-    else:
-        tts = GradiumTTSService(
-            api_key=os.environ["GRADIUM_API_KEY"],
-            json_config=_gradium_tts_json_config(),
-            settings=GradiumTTSService.Settings(
-                voice=_resolve_voice_id(tenant_runtime),
-            ),
-        )
-
-    if not use_elevenlabs:
-        assert llm is not None
+    tools = None
+    if llm is not None:
         tools = ToolsSchema(standard_tools=all_tools)
         for fn in all_tools:
             llm.register_direct_function(fn)
-    else:
-        tools = None
+        _register_slow_tool_filler(llm)
 
-    # ── "One moment" filler before slow tool calls ───────────────────────────
-    # Account/network/osascript lookups take ~0.5–4.5s. Speak a short filler the
-    # instant such a tool starts so the caller hears the agent is working instead
-    # of dead air. Instant tools (capture_*, snapshot) are excluded — no filler.
-    _SLOW_TOOLS = {
-        "check_owner_calendar",
-        "check_owner_inbox",
-        "check_github",
-        "list_reminders",
-        "add_reminder",
-        "get_calendar_context_for_caller",
-        "book_callback_slot",
-        "send_owner_email",
-    }
-
-    def _tool_call_is_slow(function_calls) -> bool:
-        return any(
-            getattr(fc, "function_name", "") in _SLOW_TOOLS for fc in function_calls
-        )
-
-    if llm is not None:
-
-        @llm.event_handler("on_function_calls_started")
-        async def _speak_filler_on_slow_tool(service, function_calls):
-            try:
-                if _tool_call_is_slow(function_calls):
-                    await service.push_frame(TTSSpeakFrame("One moment."))
-            except Exception as exc:  # never let a filler break the call
-                logger.warning(f"filler-on-tool failed: {exc}")
-
-    context = None if use_elevenlabs else LLMContext(tools=cast(Any, tools))
-    # Turn-taking: use Pipecat's default stop strategy (LocalSmartTurnAnalyzerV3),
-    # a prosody-based end-of-turn model that finalizes in ~tens of ms. We do NOT use
-    # FilterIncompleteUserTurnStrategies here: that LLM-judged gate suppresses the
-    # reply and sits silent for incomplete_short_timeout (5s) / incomplete_long_timeout
-    # (10s) whenever it marks a turn ○/◐ "incomplete" — which fires constantly over the
-    # phone (choppy Krisp/8kHz transcripts, natural caller pauses), adding multi-second
-    # latency to nearly every response. The smart-turn analyzer still avoids cutting
-    # callers off mid-sentence, without the per-turn LLM round-trip or silent waits.
+    context = None
+    user_aggregator = assistant_aggregator = None
     if not use_elevenlabs:
-        assert context is not None
-        user_aggregator, assistant_aggregator = LLMContextAggregatorPair(
-            context,
-            user_params=LLMUserAggregatorParams(
-                # OpenAI Realtime uses server-side semantic VAD and requires
-                # 24 kHz input. Silero only accepts 8/16 kHz, so keep local VAD on
-                # the cascade path and let Realtime own turn detection end-to-end.
-                vad_analyzer=None if use_openai_realtime else SileroVADAnalyzer(),
-            ),
+        context = LLMContext(tools=cast(Any, tools))
+        user_aggregator, assistant_aggregator = _build_user_aggregators(
+            context, use_openai_realtime
         )
-    else:
-        user_aggregator = assistant_aggregator = None
 
-    # P3 — passthrough processor that infers caller tone from final transcripts
-    # (no LLM round-trip). Placement differs because Realtime emits transcripts
-    # upstream from the LLM while the cascade STT emits them downstream.
-    # Adaptive speaking pace: the tone listener feeds the caller's inferred tone
-    # to the pace controller, which slows the agent for rushed/upset callers.
-    if use_elevenlabs:
-        assert convai is not None
+    if convai is not None:
         pipeline_processors = [
             transport.input(),
             convai,
             transport.output(),
         ]
-        tone_listener = None
     else:
-        assert tts is not None
-        pace_controller = _make_tts_pace_controller(tts)
-        tone_listener = persona_tools.make_transcript_tone_processor(
-            call_state, context, pace_cb=pace_controller.note_tone
-        )
-        call_end_detector = _make_call_end_detector(call_state, _hangup)
-
-        assert stt is not None or use_openai_realtime
-        assert llm is not None
-        assert tts is not None
-        assert user_aggregator is not None
-        assert assistant_aggregator is not None
-        pipeline_processors = [transport.input()]
-        if use_openai_realtime:
-            # Realtime sends final caller transcription frames upstream from the LLM
-            # service. Observe them before the user aggregator consumes them.
-            pipeline_processors.append(user_aggregator)
-        else:
-            assert stt is not None
-            pipeline_processors.append(stt)
-        pipeline_processors.extend([tone_listener, call_end_detector])
-        if not use_openai_realtime:
-            pipeline_processors.append(user_aggregator)
-        pipeline_processors.append(llm)
-        pipeline_processors.append(tts)
-        # Observe TTSStarted/Stopped just downstream of TTS to retune pace between turns.
-        pipeline_processors.append(pace_controller)
-        pipeline_processors.extend(
-            [
-                transport.output(),
-                assistant_aggregator,
-            ]
+        assert context is not None
+        pipeline_processors = _build_cascade_processors(
+            transport=transport,
+            stt=stt,
+            llm=llm,
+            tts=tts,
+            user_aggregator=user_aggregator,
+            assistant_aggregator=assistant_aggregator,
+            call_state=call_state,
+            context=context,
+            hangup=hangup,
+            use_openai_realtime=use_openai_realtime,
         )
     pipeline = Pipeline(pipeline_processors)
 
@@ -1444,69 +1721,21 @@ async def run_bot(
             audio_out_sample_rate=audio_out_sample_rate,
         ),
     )
-    _hangup["worker"] = worker
+    hangup["worker"] = worker
 
-    @worker.event_handler("on_pipeline_finished")
-    async def on_pipeline_finished(worker, frame):
-        if isinstance(frame, EndFrame) and _hangup["ending"]:
-            logger.info("Pipeline ended after end_call — hanging up transport")
-            await _finalize_call("end_call")
-            await _hang_up_transport(transport)
-
-    @transport.event_handler("on_client_connected")
-    async def on_client_connected(transport, client):
-        _hangup["finalized"] = False
-        _hangup["ending"] = False
-        logger.info("Client connected")
-        if not use_elevenlabs:
-            assert context is not None
-            persona_tools.refresh_live_style_directive(call_state, context)
-            opener = (
-                f"A caller just connected. Their number is in the owner's contacts — this is "
-                f"{recognized_caller_name}. Greet them BY NAME right away and warmly (e.g. "
-                f"\"Hey {recognized_caller_name}!\"). Do NOT ask who's calling or ask them to "
-                "confirm their name — you already know them. Then offer to take a message or "
-                "help with a quick question."
-                if recognized_caller_name
-                else "A caller just connected. Greet them and offer to take a message or help "
-                     "with a quick question."
-            )
-            context.add_message(
-                {
-                    "role": "user",
-                    "content": opener,
-                }
-            )
-            await worker.queue_frames([LLMRunFrame()])
-
-    @transport.event_handler("on_client_disconnected")
-    async def on_client_disconnected(transport, client):
-        logger.info(f"Client disconnected — call_state summary: {call_state['voicemail']}")
-        if use_openai_realtime:
-            # Realtime can still be dispatching final tool calls after Twilio
-            # closes its media websocket. Give those structured captures a brief
-            # chance to land before persistence snapshots call_state.
-            await asyncio.sleep(1.0)
-        await _finalize_call("disconnect")
-
-        # ── Cekura Observability (fire-and-forget, never raises) ───────────────
-        _vm = call_state["voicemail"]
-        _cid_raw = f"{_vm.get('recorded_at', '')}-{_vm.get('caller_number', 'unknown')}"
-        _call_id = _cid_raw.replace(":", "").replace("+", "").replace(" ", "-")
-        if use_elevenlabs:
-            assert convai is not None
-            _turns = cekura_observe._turns_from_context_messages(convai.messages)
-        else:
-            assert context is not None
-            _turns = cekura_observe._turns_from_context_messages(context.messages)
-        await cekura_observe.observe_call(
-            call_state,
-            call_id=_call_id,
-            customer_number=_vm.get("caller_number") or None,
-            transcript_turns=_turns,
+    _register_call_event_handlers(
+        _CallSession(
+            call_state=call_state,
+            hangup=hangup,
+            transport=transport,
+            worker=worker,
+            context=context,
+            convai=convai,
+            recognized_caller_name=recognized_caller_name,
+            use_openai_realtime=use_openai_realtime,
+            use_elevenlabs=use_elevenlabs,
         )
-
-        await worker.cancel()
+    )
 
     runner = WorkerRunner(handle_sigint=False)
     await runner.add_workers(worker)

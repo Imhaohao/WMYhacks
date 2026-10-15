@@ -167,6 +167,83 @@ def _candidate(
     return allow_generic and all(len(word[1]) >= 3 for word in words)
 
 
+def _record_phrases(
+    words: list[tuple[str, str]],
+    index: int,
+    seen_in: dict[str, set[int]],
+    score_boost: Counter[str],
+    *,
+    allow_acronyms: bool,
+    allow_generic: bool,
+) -> None:
+    for size in (1, 2, 3):
+        for start in range(0, len(words) - size + 1):
+            phrase_words = tuple(words[start : start + size])
+            display = _display(phrase_words)
+            normalized = display.lower()
+            if not _candidate(
+                phrase_words,
+                allow_acronyms=allow_acronyms,
+                allow_generic=allow_generic and size > 1,
+            ):
+                continue
+            seen_in[display].add(index)
+            if normalized in _KNOWN_PHRASES or _LITOTES.fullmatch(normalized):
+                score_boost[display] += 6
+            elif any(
+                word[1] in _SLANG or (allow_acronyms and _is_acronym(word[0]))
+                for word in phrase_words
+            ):
+                score_boost[display] += 3
+
+
+def _rank_phrases(
+    seen_in: dict[str, set[int]],
+    score_boost: Counter[str],
+    *,
+    min_messages: int,
+    generic_min_messages: int,
+) -> list[tuple[int, int, int, str]]:
+    ranked = []
+    for phrase, indexes in seen_in.items():
+        count = len(indexes)
+        is_generic = score_boost[phrase] == 0
+        threshold = generic_min_messages if is_generic else min_messages
+        if count < threshold:
+            continue
+        ranked.append((score_boost[phrase], len(phrase.split()), count, phrase))
+    ranked.sort(reverse=True)
+    return ranked
+
+
+def _select_phrases(ranked: list[tuple[int, int, int, str]], max_phrases: int) -> list[str]:
+    phrases: list[str] = []
+    for _, _, _, phrase in ranked:
+        lowered = phrase.lower()
+        if any(lowered in selected.lower() or selected.lower() in lowered for selected in phrases):
+            continue
+        phrases.append(phrase)
+        if len(phrases) >= max_phrases:
+            break
+    return phrases
+
+
+def _style_notes(
+    litotes_messages: int,
+    contraction_messages: int,
+    word_counts: list[int],
+    min_messages: int,
+) -> list[str]:
+    notes = []
+    if litotes_messages >= min_messages:
+        notes.append("Uses understated negation or litotes when it fits.")
+    if contraction_messages >= min_messages:
+        notes.append("Uses casual contractions and relaxed spoken phrasing.")
+    if word_counts and sum(word_counts) / len(word_counts) <= 14:
+        notes.append("Prefers short, direct replies.")
+    return notes
+
+
 def derive_lingo(
     texts: list[str],
     *,
@@ -196,53 +273,27 @@ def derive_lingo(
             litotes_messages += 1
         if _CONTRACTIONS.search(text):
             contraction_messages += 1
-        for size in (1, 2, 3):
-            for start in range(0, len(words) - size + 1):
-                phrase_words = tuple(words[start : start + size])
-                display = _display(phrase_words)
-                normalized = display.lower()
-                if not _candidate(
-                    phrase_words,
-                    allow_acronyms=allow_acronyms,
-                    allow_generic=allow_generic and size > 1,
-                ):
-                    continue
-                seen_in[display].add(index)
-                if normalized in _KNOWN_PHRASES or _LITOTES.fullmatch(normalized):
-                    score_boost[display] += 6
-                elif any(
-                    word[1] in _SLANG or (allow_acronyms and _is_acronym(word[0]))
-                    for word in phrase_words
-                ):
-                    score_boost[display] += 3
+        _record_phrases(
+            words,
+            index,
+            seen_in,
+            score_boost,
+            allow_acronyms=allow_acronyms,
+            allow_generic=allow_generic,
+        )
 
-    ranked = []
-    for phrase, indexes in seen_in.items():
-        count = len(indexes)
-        is_generic = score_boost[phrase] == 0
-        threshold = generic_min_messages if is_generic else min_messages
-        if count < threshold:
-            continue
-        ranked.append((score_boost[phrase], len(phrase.split()), count, phrase))
-    ranked.sort(reverse=True)
-
-    phrases: list[str] = []
-    for _, _, _, phrase in ranked:
-        lowered = phrase.lower()
-        if any(lowered in selected.lower() or selected.lower() in lowered for selected in phrases):
-            continue
-        phrases.append(phrase)
-        if len(phrases) >= max_phrases:
-            break
-
-    notes = []
-    if litotes_messages >= min_messages:
-        notes.append("Uses understated negation or litotes when it fits.")
-    if contraction_messages >= min_messages:
-        notes.append("Uses casual contractions and relaxed spoken phrasing.")
-    if word_counts and sum(word_counts) / len(word_counts) <= 14:
-        notes.append("Prefers short, direct replies.")
-    return LingoProfile(phrases=phrases, style_notes=notes)
+    ranked = _rank_phrases(
+        seen_in,
+        score_boost,
+        min_messages=min_messages,
+        generic_min_messages=generic_min_messages,
+    )
+    return LingoProfile(
+        phrases=_select_phrases(ranked, max_phrases),
+        style_notes=_style_notes(
+            litotes_messages, contraction_messages, word_counts, min_messages
+        ),
+    )
 
 
 def derive_onboarding_lingo(

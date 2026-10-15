@@ -103,97 +103,84 @@ async def get_call_info(call_sid: str) -> dict:
         return {}
 
 
-async def run_bot(
-    transport: BaseTransport,
-    from_number: str | None = None,
-    audio_in_sample_rate: int = 16000,
-    audio_out_sample_rate: int = 24000,
-):
-    """Main bot logic.
+def _bouquet_matches(info: dict, occasion: str | None, specials_only: bool) -> bool:
+    if not info["in_stock"]:
+        return False
+    if specials_only and not info.get("on_special", False):
+        return False
+    if occasion is None:
+        return True
+    occ = occasion.strip().lower()
+    tags = [o.lower() for o in info.get("occasions", [])]
+    return any(occ in tag or tag in occ for tag in tags)
+
+
+async def list_bouquets(
+    params: FunctionCallParams,
+    occasion: str | None = None,
+    specials_only: bool = False,
+) -> None:
+    """List bouquets available today. Optionally filter by occasion or by
+    what's currently on special.
+
+    Use this when the caller asks what's available, mentions a specific
+    occasion ("it's for my mom's birthday", "for Valentine's Day", "for a
+    funeral"), or asks about specials/deals. Sold-out bouquets are
+    automatically excluded from results.
 
     Args:
-        transport: The transport to use.
-        from_number: Caller's phone number (Twilio path only) for known-customer lookup.
-        audio_in_sample_rate: Input audio sample rate in Hz. Defaults to 16000 (WebRTC).
-        audio_out_sample_rate: Output audio sample rate in Hz. Defaults to 24000 (WebRTC).
+        occasion: Lowercase occasion to filter by. Common values:
+            "birthday", "anniversary", "valentine's day", "mother's day",
+            "sympathy", "wedding", "graduation", "thank you", "get well",
+            "new baby", "housewarming", "christmas", "easter", "just
+            because". Pass the canonical short form ("birthday", not "mom's
+            birthday"). Omit to return the full catalog.
+        specials_only: If True, only return bouquets currently on special.
     """
-    logger.info("Starting bot")
+    results = [
+        {"name": name, **info}
+        for name, info in BOUQUETS.items()
+        if _bouquet_matches(info, occasion, specials_only)
+    ]
 
-    # Per-call order state. Closed over by the tool functions below so each
-    # call gets its own isolated order.
-    order: dict = {"items": [], "delivery": None}
+    if not results and (occasion is not None or specials_only):
+        await params.result_callback(
+            {
+                "bouquets": [],
+                "note": (
+                    "No bouquets match those filters. Tell the caller you don't have "
+                    "anything specifically for that, and offer to browse the full "
+                    "catalog or try a different angle."
+                ),
+            }
+        )
+        return
 
-    # --- Tools the LLM can call ---------------------------------------------
+    await params.result_callback({"bouquets": results})
 
-    async def list_bouquets(
-        params: FunctionCallParams,
-        occasion: str | None = None,
-        specials_only: bool = False,
-    ) -> None:
-        """List bouquets available today. Optionally filter by occasion or by
-        what's currently on special.
 
-        Use this when the caller asks what's available, mentions a specific
-        occasion ("it's for my mom's birthday", "for Valentine's Day", "for a
-        funeral"), or asks about specials/deals. Sold-out bouquets are
-        automatically excluded from results.
+async def check_availability(params: FunctionCallParams, bouquet_name: str) -> None:
+    """Check whether a specific bouquet is in stock today.
 
-        Args:
-            occasion: Lowercase occasion to filter by. Common values:
-                "birthday", "anniversary", "valentine's day", "mother's day",
-                "sympathy", "wedding", "graduation", "thank you", "get well",
-                "new baby", "housewarming", "christmas", "easter", "just
-                because". Pass the canonical short form ("birthday", not "mom's
-                birthday"). Omit to return the full catalog.
-            specials_only: If True, only return bouquets currently on special.
-        """
-        results = []
-        for name, info in BOUQUETS.items():
-            if not info["in_stock"]:
-                continue
-            if specials_only and not info.get("on_special", False):
-                continue
-            if occasion is not None:
-                occ = occasion.strip().lower()
-                tags = [o.lower() for o in info.get("occasions", [])]
-                if not any(occ in tag or tag in occ for tag in tags):
-                    continue
-            results.append({"name": name, **info})
+    Args:
+        bouquet_name: The name of the bouquet to check, lowercase.
+    """
+    item = BOUQUETS.get(bouquet_name.lower())
+    if not item:
+        await params.result_callback(
+            {"available": False, "reason": f"We don't carry a bouquet called '{bouquet_name}'."}
+        )
+        return
+    if not item["in_stock"]:
+        await params.result_callback(
+            {"available": False, "reason": f"{bouquet_name} is sold out today."}
+        )
+        return
+    await params.result_callback({"available": True, "price": item["price"]})
 
-        if not results and (occasion is not None or specials_only):
-            await params.result_callback(
-                {
-                    "bouquets": [],
-                    "note": (
-                        "No bouquets match those filters. Tell the caller you don't have "
-                        "anything specifically for that, and offer to browse the full "
-                        "catalog or try a different angle."
-                    ),
-                }
-            )
-            return
 
-        await params.result_callback({"bouquets": results})
-
-    async def check_availability(params: FunctionCallParams, bouquet_name: str) -> None:
-        """Check whether a specific bouquet is in stock today.
-
-        Args:
-            bouquet_name: The name of the bouquet to check, lowercase.
-        """
-        item = BOUQUETS.get(bouquet_name.lower())
-        if not item:
-            await params.result_callback(
-                {"available": False, "reason": f"We don't carry a bouquet called '{bouquet_name}'."}
-            )
-            return
-        if not item["in_stock"]:
-            await params.result_callback(
-                {"available": False, "reason": f"{bouquet_name} is sold out today."}
-            )
-            return
-        await params.result_callback({"available": True, "price": item["price"]})
-
+def _make_order_tools(order: dict) -> list:
+    """Order-editing tools bound to this call's isolated order."""
     async def add_to_order(
         params: FunctionCallParams, bouquet_name: str, quantity: int = 1
     ) -> None:
@@ -269,34 +256,26 @@ async def run_bot(
             }
         )
 
-    async def end_call(params: FunctionCallParams) -> None:
-        """End the call. Only call this AFTER you have said goodbye to the
-        customer in the same turn. The pipeline will flush any queued speech
-        and then hang up."""
-        logger.info("end_call invoked — pushing EndTaskFrame upstream")
-        await params.llm.push_frame(EndTaskFrame(), FrameDirection.UPSTREAM)
-        # run_llm=False prevents the LLM from generating a follow-up response
-        # after this function returns — the goodbye should already be in flight.
-        await params.result_callback(
-            {"ok": True}, properties=FunctionCallResultProperties(run_llm=False)
-        )
+    return [add_to_order, get_order_summary, set_delivery_details, place_order]
 
-    tool_functions = [
-        list_bouquets,
-        check_availability,
-        add_to_order,
-        get_order_summary,
-        set_delivery_details,
-        place_order,
-        end_call,
-    ]
-    tools = ToolsSchema(standard_tools=tool_functions)
 
-    # --- System instruction (varies based on caller ID) ---------------------
+async def end_call(params: FunctionCallParams) -> None:
+    """End the call. Only call this AFTER you have said goodbye to the
+    customer in the same turn. The pipeline will flush any queued speech
+    and then hang up."""
+    logger.info("end_call invoked — pushing EndTaskFrame upstream")
+    await params.llm.push_frame(EndTaskFrame(), FrameDirection.UPSTREAM)
+    # run_llm=False prevents the LLM from generating a follow-up response
+    # after this function returns — the goodbye should already be in flight.
+    await params.result_callback(
+        {"ok": True}, properties=FunctionCallResultProperties(run_llm=False)
+    )
 
+
+def _caller_context(from_number: str | None) -> str:
     customer = KNOWN_CUSTOMERS.get(from_number or "")
     if customer:
-        caller_context = (
+        return (
             f"This caller is a returning customer (caller ID matched). On file: "
             f"name {customer['name']}, last order the {customer['last_order']} bouquet. "
             'Greet them generically: "Welcome back to Field & Flower! How can I help '
@@ -306,12 +285,14 @@ async def run_bot(
             f'"I have you down for the {customer["last_order"]} last time, want that '
             'again or something different?" Always give them the alternative.'
         )
-    else:
-        caller_context = (
-            "You're talking to a new customer. Introduce the shop briefly and ask how you can help."
-        )
+    return (
+        "You're talking to a new customer. Introduce the shop briefly and ask how you can help."
+    )
 
-    system_instruction = (
+
+def _build_system_instruction(from_number: str | None) -> str:
+    caller_context = _caller_context(from_number)
+    return (
         "You are a friendly order-taker for Field & Flower, a neighborhood flower shop. "
         "Help callers pick a bouquet and arrange delivery. Use the tools to look up "
         "bouquets, check stock, add items, capture delivery details, and place the order. "
@@ -346,6 +327,37 @@ async def run_bot(
         'gives a relative delivery date like "this Friday" or "next Tuesday".\n\n'
         f"Caller context: {caller_context}"
     )
+
+
+async def run_bot(
+    transport: BaseTransport,
+    from_number: str | None = None,
+    audio_in_sample_rate: int = 16000,
+    audio_out_sample_rate: int = 24000,
+):
+    """Main bot logic.
+
+    Args:
+        transport: The transport to use.
+        from_number: Caller's phone number (Twilio path only) for known-customer lookup.
+        audio_in_sample_rate: Input audio sample rate in Hz. Defaults to 16000 (WebRTC).
+        audio_out_sample_rate: Output audio sample rate in Hz. Defaults to 24000 (WebRTC).
+    """
+    logger.info("Starting bot")
+
+    # Per-call order state. Closed over by the order tools so each call gets
+    # its own isolated order.
+    order: dict = {"items": [], "delivery": None}
+
+    tool_functions = [
+        list_bouquets,
+        check_availability,
+        *_make_order_tools(order),
+        end_call,
+    ]
+    tools = ToolsSchema(standard_tools=tool_functions)
+
+    system_instruction = _build_system_instruction(from_number)
 
     # Speech-to-Text service
     stt = GradiumSTTService(
