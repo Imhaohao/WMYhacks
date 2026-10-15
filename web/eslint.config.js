@@ -18,5 +18,8 @@ export default defineConfig([
     languageOptions: {
       globals: globals.browser,
     },
+    rules: {
+      complexity: ['error', 15],
+    },
   },
 ])

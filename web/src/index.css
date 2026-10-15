@@ -1,72 +1,127 @@
-@import url("https://fonts.googleapis.com/css2?family=DM+Sans:ital,opsz,wght@0,9..40,400;0,9..40,500;0,9..40,600;0,9..40,700;1,9..40,400&family=Fraunces:ital,opsz,wght@0,9..144,400;0,9..144,500;0,9..144,600;0,9..144,700;1,9..144,500&display=swap");
+@import "@fontsource-variable/hanken-grotesk";
 @import "tailwindcss";
 
 @theme {
-  --font-display: "Fraunces", Georgia, serif;
-  --font-sans: "DM Sans", system-ui, sans-serif;
+  --font-sans: "Hanken Grotesk Variable", ui-sans-serif, system-ui, sans-serif;
 
-  /* warm parchment canvas + ink */
-  --color-canvas: #ece5d4;
-  --color-parchment: #f4efe3;
-  --color-ink: #38403a;
+  --color-surface: var(--surface);
+  --color-raised: var(--raised);
+  --color-sunken: var(--sunken);
+  --color-ink: var(--ink);
+  --color-muted: var(--muted);
+  --color-line: var(--line);
+  --color-accent: var(--accent);
+  --color-accent-soft: var(--accent-soft);
+  --color-urgent: var(--urgent);
+  --color-urgent-soft: var(--urgent-soft);
+  --color-control: var(--control);
+  --color-control-ink: var(--control-ink);
+  --color-control-hover: var(--control-hover);
 
-  /* sage — primary accent (muted post-expressionist green) */
-  --color-sage-50: #f1f4ec;
-  --color-sage-100: #e3e9d7;
-  --color-sage-200: #c9d4b4;
-  --color-sage-300: #aaba8c;
-  --color-sage-400: #8ea06c;
-  --color-sage-500: #738755;
-  --color-sage-600: #5c6e44;
-  --color-sage-700: #485737;
-  --color-sage-800: #39452e;
-  --color-sage-900: #2f3927;
+  --radius-control: 0.75rem;
+  --radius-control-inner: 0.5rem;
+  --radius-panel: 1.25rem;
+  --radius-panel-inner: 0.75rem;
 
-  /* dusk — dusty blue secondary */
-  --color-dusk-50: #eef2f4;
-  --color-dusk-100: #dde5ea;
-  --color-dusk-200: #bccdd6;
-  --color-dusk-300: #93aebd;
-  --color-dusk-400: #6f93a6;
-  --color-dusk-500: #547a8e;
-  --color-dusk-600: #436374;
-  --color-dusk-700: #374f5d;
-  --color-dusk-800: #2f414c;
-  --color-dusk-900: #283742;
+  --shadow-panel: 0 1px 2px rgb(22 30 25 / 0.06), 0 12px 32px -12px rgb(22 30 25 / 0.18);
+  --shadow-control: 0 1px 2px rgb(22 30 25 / 0.12);
 
-  /* mauve — soft lavender highlight */
-  --color-mauve-300: #b8b2c8;
-  --color-mauve-400: #a098b6;
-  --color-mauve-500: #877e9e;
+  --ease-out-soft: cubic-bezier(0.16, 1, 0.3, 1);
+}
+
+:root {
+  color-scheme: light;
+  --surface: #f3f4f1;
+  --raised: #fcfcfb;
+  --sunken: #e8eae5;
+  --ink: #161a17;
+  --muted: #555d58;
+  --line: rgb(22 26 23 / 0.11);
+  --accent: #1d7348;
+  --accent-soft: #dcefe3;
+  --urgent: #b3341f;
+  --urgent-soft: #f7e1db;
+  --control: #161a17;
+  --control-ink: #f6f7f4;
+  --control-hover: #2c322e;
+}
+
+@media (prefers-color-scheme: dark) {
+  :root {
+    color-scheme: dark;
+    --surface: #111412;
+    --raised: #1a1e1b;
+    --sunken: #0b0d0c;
+    --ink: #eceeea;
+    --muted: #a0a8a2;
+    --line: rgb(236 238 234 / 0.1);
+    --accent: #5cc58d;
+    --accent-soft: #173a27;
+    --urgent: #f08a73;
+    --urgent-soft: #3d1c15;
+    --control: #eceeea;
+    --control-ink: #111412;
+    --control-hover: #d4d8d3;
+  }
 }
 
 @layer base {
-  * {
-    border-color: color-mix(in srgb, var(--color-ink) 14%, transparent);
-  }
-
   body {
-    background-color: var(--color-canvas);
-    color: var(--color-ink);
-    @apply antialiased;
+    background-color: var(--surface);
+    color: var(--ink);
     font-family: var(--font-sans);
+    -webkit-font-smoothing: antialiased;
   }
 
   h1,
   h2,
   h3 {
-    font-family: var(--font-display);
-    letter-spacing: -0.01em;
+    text-wrap: balance;
+  }
+
+  p {
+    text-wrap: pretty;
   }
 }
 
-@layer utilities {
-  /* Soft painterly wash — cream base brushed with sage / dusk / lavender light */
-  .bg-wash {
-    background-color: var(--color-parchment);
-    background-image:
-      radial-gradient(38rem 28rem at 12% 8%, rgba(142, 160, 108, 0.32), transparent 60%),
-      radial-gradient(34rem 26rem at 88% 18%, rgba(111, 147, 166, 0.3), transparent 62%),
-      radial-gradient(40rem 32rem at 50% 112%, rgba(160, 152, 182, 0.3), transparent 60%);
+@layer components {
+  .text-display {
+    font-size: clamp(2.5rem, 5.6vw, 4.25rem);
+    line-height: 1.02;
+    font-weight: 700;
+  }
+
+  .text-title {
+    font-size: clamp(1.75rem, 3vw, 2.5rem);
+    line-height: 1.1;
+    font-weight: 650;
+  }
+
+  .text-lead {
+    font-size: 1.125rem;
+    line-height: 1.55;
+    color: var(--muted);
+  }
+
+  .reveal {
+    animation: reveal 0.7s var(--ease-out-soft) both;
+    animation-delay: var(--reveal-delay, 0s);
+  }
+
+  @media (prefers-reduced-motion: reduce) {
+    .reveal {
+      animation: none;
+    }
+  }
+
+  .figures {
+    font-variant-numeric: tabular-nums;
+  }
+}
+
+@keyframes reveal {
+  from {
+    opacity: 0;
+    transform: translateY(16px);
   }
 }

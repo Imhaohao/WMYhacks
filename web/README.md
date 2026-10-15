@@ -1,53 +1,24 @@
-# Gotchu — onboarding web UI
+# Gotchu web app
 
-Owner-facing landing page and setup wizard for the voicemail agent.
+Landing page, signup and the screened-calls inbox.
 
-The public entry point is `/onboarding`: a streamlined, public-safe flow for
-conditional voicemail forwarding, a consented owner voice sample, and diction
-examples. When `VITE_ONBOARDING_API_URL` is blank, drafts stay in the visitor's
-browser and audio is not uploaded. Set the URL only for a trusted private
-deployment whose backend has `ALLOW_OWNER_PROVISIONING=true`.
+| Route | What it does |
+|---|---|
+| `/` | Landing page with an example screened call |
+| `/onboarding` | Name, mobile and email, then the carrier code that forwards missed calls to the Gotchu line |
+| `/calls` | The owner's screened calls, refreshed every 5 seconds |
+
+The browser keeps the tenant id and onboarding token in `localStorage` and sends the token as `X-Onboarding-Token`.
 
 ## Run locally
 
-Terminal 1 — onboarding API (port 8787):
-
 ```bash
-cd server
-uv run python onboarding_api.py
+cd server && uv run python onboarding_api.py   # API on :8787
+cd web && npm install && npm run dev           # UI on :5173, proxies /api to :8787
 ```
 
-Terminal 2 — web app (port 5173):
+Set `ONBOARDING_API_PROXY` to point the dev proxy at another API port. The API needs `ENABLE_PUBLIC_TENANT_ONBOARDING=true` and a phone mode such as `ENABLE_SHARED_FORWARDING_ROUTING=true`; see `server/PRODUCTION_ONBOARDING.md`.
 
-```bash
-cd web
-npm install
-npm run dev
-```
+## Deploy
 
-Open [http://127.0.0.1:5173](http://127.0.0.1:5173)
-
-Optional — voice bot for **Try call**:
-
-```bash
-cd server
-ENV=local uv run bot-nemotron.py
-```
-
-Then open [http://localhost:7860](http://localhost:7860) from the Try page.
-
-## Pages
-
-| Route | Purpose |
-|---|---|
-| `/` | Hero + integrations orbit + CTA |
-| `/setup` | 5-step wizard (profile, vCard, calendar, health, try) |
-| `/try` | Interactive phone demo + WebRTC link |
-
-## API
-
-Proxied via Vite to `http://127.0.0.1:8787`:
-
-- `GET/POST /api/owner-config` — saved to `server/owner_config.json`
-- `POST /api/contacts/upload` — writes `server/contacts.vcf`
-- `GET /api/health` — env + contacts preflight
+On Vercel, `api/proxy.js` forwards `/api/*` to `ONBOARDING_API_TARGET_ORIGIN` (the voice worker's public origin), so preview URLs need no CORS entry.
