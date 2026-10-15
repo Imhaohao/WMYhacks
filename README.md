@@ -4,6 +4,8 @@ When you miss a call, Gotchu answers, asks who is calling and why, and texts you
 
 ![Screened calls inbox](artifact/gotchu-screened-calls.webp)
 
+Local run with fictional callers: the two calls were saved through the bot's hang-up code on a local API, not placed over a phone line.
+
 Started at the YC Voice Agents Hackathon by Jerry Yan, David Wu and alaramartin. The web app is in [`web/`](web/README.md); the voice worker and onboarding API are in [`server/`](server/PRODUCTION_ONBOARDING.md).
 
 ---

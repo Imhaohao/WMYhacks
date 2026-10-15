@@ -46,6 +46,11 @@ def owner_text(message: dict[str, Any], caller_number: str) -> str:
     return text[: OWNER_TEXT_LIMIT - 3].rstrip() + "..."
 
 
+def _caller_words(transcript: Any) -> str:
+    lines = str(transcript or "").splitlines()
+    return " ".join(line.strip().removeprefix("Caller:").strip() for line in lines if line.strip())
+
+
 def inbox_entry(record: dict[str, Any]) -> dict[str, Any]:
     voicemail = record.get("voicemail") or {}
     message = voicemail.get("message") or {}
@@ -61,7 +66,7 @@ def inbox_entry(record: dict[str, Any]) -> dict[str, Any]:
         "wants_callback": bool(message.get("wants_callback")),
         "callback_number": _clean(message.get("callback_number")),
         "callback_time": _clean(message.get("callback_preferred_time")),
-        "caller_words": str(voicemail.get("transcript") or "").strip(),
+        "caller_words": _caller_words(voicemail.get("transcript")),
         "owner_text": owner_text(message, caller_number),
         "texted": bool(voicemail.get("sms_sent")),
     }
