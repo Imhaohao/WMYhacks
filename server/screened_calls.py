@@ -16,9 +16,10 @@ def _clean(value: Any) -> str:
 
 def _mid_sentence(phrase: str) -> str:
     """Lower-case a leading capital ("Moving ...") but keep acronyms ("IRS ...")."""
-    if phrase[1:2].islower():
-        return phrase[:1].lower() + phrase[1:]
-    return phrase
+    first_word = phrase.split(" ", 1)[0]
+    if first_word == "I" or (len(first_word) > 1 and first_word.isupper()):
+        return phrase
+    return phrase[:1].lower() + phrase[1:]
 
 
 def _callback_sentence(message: dict[str, Any], caller_number: str) -> str:

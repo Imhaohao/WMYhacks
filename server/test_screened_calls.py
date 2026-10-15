@@ -58,3 +58,4 @@ def test_inbox_entry_exposes_only_owner_facing_fields():
 
 def test_owner_text_keeps_acronyms_capitalised():
     assert "about IRS paperwork." in owner_text({"caller_name": "Lee", "reason": "IRS paperwork"}, "")
+    assert "about a brake repair." in owner_text({"caller_name": "Sam", "reason": "A brake repair"}, "")
