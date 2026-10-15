@@ -49,11 +49,11 @@ function useInbox(session: Session): [Inbox, Agent | null] {
 
 function LineFacts({ agent }: { agent: Agent }) {
   return (
-    <dl className="figures mt-5 grid grid-cols-[auto_1fr] gap-x-6 gap-y-1 text-base">
+    <dl className="figures mt-5 grid grid-cols-[auto_1fr] gap-x-6 gap-y-1 text-base lg:grid-cols-1 lg:gap-x-0">
       <dt className="text-muted">Gotchu line</dt>
-      <dd className="font-semibold">{formatPhone(agentLine(agent))}</dd>
+      <dd className="font-semibold lg:mb-3">{formatPhone(agentLine(agent))}</dd>
       <dt className="text-muted">Texts go to</dt>
-      <dd className="font-semibold">{formatPhone(agent.owner_phone)}</dd>
+      <dd className="font-semibold lg:mb-3">{formatPhone(agent.owner_phone)}</dd>
     </dl>
   )
 }
@@ -121,13 +121,15 @@ function Inbox({ session }: { session: Session }) {
   const [inbox, agent] = useInbox(session)
   if (inbox.state === "lost") return <LostSession />
   return (
-    <>
-      <h1 className="text-title">Your screened calls</h1>
-      {agent && <LineFacts agent={agent} />}
-      <div aria-live="polite" className="mt-10">
+    <div className="grid gap-10 lg:grid-cols-[16rem_1fr] lg:gap-16">
+      <div className="lg:sticky lg:top-8 lg:self-start">
+        <h1 className="text-title">Your screened calls</h1>
+        {agent && <LineFacts agent={agent} />}
+      </div>
+      <div aria-live="polite" className="max-w-3xl">
         <CallList inbox={inbox} agent={agent} />
       </div>
-    </>
+    </div>
   )
 }
 
@@ -137,7 +139,7 @@ export function CallsPage() {
   return (
     <div className="min-h-[100dvh]">
       <SiteHeader />
-      <main className="mx-auto w-full max-w-2xl px-4 pb-24 pt-8 sm:px-6 sm:pt-14">
+      <main className="mx-auto w-full max-w-6xl px-4 pb-24 pt-8 sm:px-6 sm:pt-14">
         <Inbox session={session} />
       </main>
     </div>
